@@ -10,6 +10,7 @@ import re
 # create a database to store the results of LLM calls
 import sqlite3
 import subprocess
+import threading
 
 def load_bash_env(bashrc_path: str = None) -> None:
     """Loads environment variables from a bashrc file into os.environ."""
@@ -53,7 +54,7 @@ DB_FILE = os.path.expanduser('~/llm_calls.db')
 
 # If the database doesn't exist, create it
 if not os.path.exists(DB_FILE):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.execute('CREATE TABLE llm_calls (prompt TEXT, model_name TEXT, params TEXT, thinking TEXT, result TEXT, parse_json BOOLEAN)')
     conn.close()
 
@@ -192,8 +193,10 @@ class LLMCaller:
             "kimi-k2-turbo-preview" : MoonShotAPI("kimi-k2-turbo-preview"),
         }
 
-        # Open the database
-        self.conn = sqlite3.connect(DB_FILE)
+        # Open the database with check_same_thread=False to allow cross-thread usage
+        # Use threading lock for thread safety
+        self.db_lock = threading.Lock()
+        self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self.cursor = self.conn.cursor()
 
         self.params = ""
@@ -204,16 +207,17 @@ class LLMCaller:
             
         model = self.models[model_family]
 
-        # Check if the result is already in the database
+        # Check if the result is already in the database (thread-safe)
         if self.use_cache:
-            self.cursor.execute('SELECT result, thinking, parse_json FROM llm_calls WHERE prompt = ? AND model_name = ? AND params = ?', (prompt, model.model_name, self.params))
-            result = self.cursor.fetchone()
-            if result:
-                assert parse_json == result[2], f"Parse JSON flag mismatch: {parse_json} != {result[2]}"
-                if parse_json:
-                    return tolerantjson.tolerate(result[0]), result[1]
-                else:
-                    return result[0], result[1]
+            with self.db_lock:
+                self.cursor.execute('SELECT result, thinking, parse_json FROM llm_calls WHERE prompt = ? AND model_name = ? AND params = ?', (prompt, model.model_name, self.params))
+                result = self.cursor.fetchone()
+                if result:
+                    assert parse_json == result[2], f"Parse JSON flag mismatch: {parse_json} != {result[2]}"
+                    if parse_json:
+                        return tolerantjson.tolerate(result[0]), result[1]
+                    else:
+                        return result[0], result[1]
 
         # If the result is not in the database, or we are not in deterministic mode, generate it
         for _ in range(max_retries):
@@ -234,9 +238,10 @@ class LLMCaller:
                 time.sleep(1)
                 continue
 
-        # Save only the successful result. If the result is already in the database, it will be overwritten.
-        self.cursor.execute('INSERT INTO llm_calls (prompt, model_name, params, result, thinking, parse_json) VALUES (?, ?, ?, ?, ?, ?)', (prompt, model.model_name, self.params, result, thinking, parse_json))
-        self.conn.commit()
+        # Save only the successful result. If the result is already in the database, it will be overwritten. (thread-safe)
+        with self.db_lock:
+            self.cursor.execute('INSERT INTO llm_calls (prompt, model_name, params, result, thinking, parse_json) VALUES (?, ?, ?, ?, ?, ?)', (prompt, model.model_name, self.params, result, thinking, parse_json))
+            self.conn.commit()
 
         if parse_json:
             return result_json, thinking
