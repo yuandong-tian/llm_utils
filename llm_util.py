@@ -155,6 +155,29 @@ class GrokAPI:
 
         return response.choices[0].message.content, ""
 
+class OpenAIAPI:
+    def __init__(self, model_name: str, api_base: str, api_key_env: str = "OPENAI_API_KEY"):
+        if not api_base:
+            raise RuntimeError("Missing api_base for OpenAI-compatible API.")
+        api_base = api_base.rstrip("/")
+        if not api_base.endswith("/v1"):
+            api_base = f"{api_base}/v1"
+        api_key = get_env_var(api_key_env) or "EMPTY"
+        self.model = OpenAI(
+            api_key=api_key,
+            base_url=api_base,
+        )
+        self.model_name = model_name
+
+    def generate(self, prompt: str) -> str:
+        response = self.model.chat.completions.create(
+            model=self.model_name,
+            messages=[
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return response.choices[0].message.content, ""
+
 class OllamaAPI:
     def __init__(self, model_name: str = "deepseek-r1:32b"):
         self.model_name = model_name
@@ -181,9 +204,10 @@ class OllamaAPI:
         
 
 class LLMCaller:
-    def __init__(self, use_cache: bool = True, default_model: str = "gemini-2.5-flash"):
+    def __init__(self, use_cache: bool = True, default_model: str = "gemini-2.5-flash", api_base: str = None):
         self.use_cache = use_cache
         self.default_model = default_model
+        self.api_base = api_base
 
         self.model_factories = {
             "gemini-2.0-flash" : lambda: GeminiAPI("gemini-2.0-flash"),
@@ -194,6 +218,7 @@ class LLMCaller:
             "deepseek-v3" : lambda: DeepSeekAPI("deepseek-chat"),
             "deepseek-r1" : lambda: DeepSeekAPI("deepseek-reasoner"),
             "grok-2" : lambda: GrokAPI(),
+            "openai-api" : lambda: OpenAIAPI(self.default_model, api_base=self.api_base),
             "deepseek-r1:32b" : lambda: OllamaAPI("deepseek-r1:32b"),
             "gemma3:27b" : lambda: OllamaAPI("gemma3:27b"),
             "qwen3:32b" : lambda: OllamaAPI("qwen3:32b"),
