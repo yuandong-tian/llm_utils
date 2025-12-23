@@ -1,5 +1,5 @@
 import random
-import time
+import asyncio
 import tolerantjson
 from google import genai
 from openai import OpenAI
@@ -214,6 +214,20 @@ class LLMCaller:
         self.params = ""
 
     def generate(self, prompt: str, model_family: str = None, parse_json: bool = False, max_retries: int = 3) -> str:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.generate_async(
+                    prompt,
+                    model_family=model_family,
+                    parse_json=parse_json,
+                    max_retries=max_retries,
+                )
+            )
+        raise RuntimeError("LLMCaller.generate cannot run inside an event loop. Use generate_async instead.")
+
+    async def generate_async(self, prompt: str, model_family: str = None, parse_json: bool = False, max_retries: int = 3) -> str:
         if model_family is None:
             model_family = self.default_model
             
@@ -221,20 +235,27 @@ class LLMCaller:
 
         # Check if the result is already in the database (thread-safe)
         if self.use_cache:
-            with self.db_lock:
-                self.cursor.execute('SELECT result, thinking, parse_json FROM llm_calls WHERE prompt = ? AND model_name = ? AND params = ?', (prompt, model.model_name, self.params))
-                result = self.cursor.fetchone()
-                if result:
-                    assert parse_json == result[2], f"Parse JSON flag mismatch: {parse_json} != {result[2]}"
-                    if parse_json:
-                        return tolerantjson.tolerate(result[0]), result[1]
-                    else:
-                        return result[0], result[1]
+            def _read_cache():
+                with self.db_lock:
+                    self.cursor.execute(
+                        'SELECT result, thinking, parse_json FROM llm_calls WHERE prompt = ? AND model_name = ? AND params = ?',
+                        (prompt, model.model_name, self.params),
+                    )
+                    return self.cursor.fetchone()
+
+            result = await asyncio.to_thread(_read_cache)
+            if result:
+                assert parse_json == result[2], f"Parse JSON flag mismatch: {parse_json} != {result[2]}"
+                if parse_json:
+                    return tolerantjson.tolerate(result[0]), result[1]
+                return result[0], result[1]
 
         # If the result is not in the database, or we are not in deterministic mode, generate it
-        for _ in range(max_retries):
+        last_error = None
+        base_sleep_time = 1
+        for attempt in range(max_retries):
             try:
-                result, thinking = model.generate(prompt)
+                result, thinking = await asyncio.to_thread(model.generate, prompt)
                 if parse_json:
                     if result.startswith("```json"):
                         result = result[7:]
@@ -244,16 +265,30 @@ class LLMCaller:
                 else:
                     result = result.strip()
                 thinking = thinking.strip()
+                last_error = None
                 break
             except Exception as e:
-                print(f"Error generating: {e}, will try again in 1 second")
-                time.sleep(1)
+                last_error = e
+                print(f"Error generating: {e}, will try again")
+                if attempt < max_retries - 1:
+                    sleep_time = base_sleep_time * (2 ** attempt) + random.uniform(0, 1)
+                    sleep_time = min(sleep_time, 30)
+                    await asyncio.sleep(sleep_time)
                 continue
 
+        if last_error is not None:
+            raise RuntimeError(f"LLM generation failed after {max_retries} attempts: {last_error}")
+
         # Save only the successful result. If the result is already in the database, it will be overwritten. (thread-safe)
-        with self.db_lock:
-            self.cursor.execute('INSERT INTO llm_calls (prompt, model_name, params, result, thinking, parse_json) VALUES (?, ?, ?, ?, ?, ?)', (prompt, model.model_name, self.params, result, thinking, parse_json))
-            self.conn.commit()
+        def _write_cache():
+            with self.db_lock:
+                self.cursor.execute(
+                    'INSERT INTO llm_calls (prompt, model_name, params, result, thinking, parse_json) VALUES (?, ?, ?, ?, ?, ?)',
+                    (prompt, model.model_name, self.params, result, thinking, parse_json),
+                )
+                self.conn.commit()
+
+        await asyncio.to_thread(_write_cache)
 
         if parse_json:
             return result_json, thinking
@@ -268,7 +303,7 @@ class LLMCaller:
         return self.models[model_family]
 
 
-def main():
+async def main_async():
     """Test function for LLMCaller."""
     parser = argparse.ArgumentParser(description="Test LLMCaller with a query")
     parser.add_argument("query", type=str, help="The query to send to the LLM")
@@ -285,7 +320,7 @@ def main():
     print("Generating response...\n")
     
     # Call the generate method
-    response, thinking = caller.generate(args.query)
+    response, thinking = await caller.generate_async(args.query)
     
     # Print out the response
     print("Response:")
@@ -298,4 +333,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
