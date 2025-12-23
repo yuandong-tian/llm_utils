@@ -1,11 +1,11 @@
 import random
 import time
 import tolerantjson
-import ollama
-import google.generativeai as genai
+from google import genai
 from openai import OpenAI
 import os
 import re
+import argparse
 
 # create a database to store the results of LLM calls
 import sqlite3
@@ -60,6 +60,8 @@ if not os.path.exists(DB_FILE):
 
 class MoonShotAPI:
     def __init__(self, model_name: str = "kimi-k2-0905-preview"):
+        if not get_env_var("KIMI_API_KEY"):
+            raise RuntimeError("Missing KIMI_API_KEY for MoonShot API.")
         self.model_name = model_name
         self.client = OpenAI(
             api_key = get_env_var("KIMI_API_KEY"),
@@ -86,20 +88,26 @@ class GeminiAPI:
             env_key = random.choice(ENV_KEYS)
         else:
             env_key = 'GEMINI_API_KEY'
-        print(f"Using Gemini API key: {env_key}")
         api_key = get_env_var(env_key)
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
+        if not api_key:
+            raise RuntimeError(f"Missing {env_key} for Gemini API.")
+        print(f"Using Gemini API key: {env_key}")
+        self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
     def generate(self, prompt: str) -> str:
-        result = self.model.generate_content(prompt)
+        result = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+        )
         # No thinking process for Gemini
         return result.text.strip(), ""
     
     
 class DeepSeekAPI:
     def __init__(self, model_name: str = "deepseek-reasoner"):
+        if not get_env_var("DEEPSEEK_TOKEN"):
+            raise RuntimeError("Missing DEEPSEEK_TOKEN for DeepSeek API.")
         self.model = OpenAI(
             api_key=get_env_var("DEEPSEEK_TOKEN"), 
             base_url="https://api.deepseek.com"
@@ -122,6 +130,8 @@ class DeepSeekAPI:
 
 class GrokAPI:
     def __init__(self, model_name: str = "grok-2-latest"):
+        if not get_env_var("XAI_API_KEY_X"):
+            raise RuntimeError("Missing XAI_API_KEY_X for Grok API.")
         self.model = OpenAI(
             api_key=get_env_var("XAI_API_KEY_X"),
             base_url="https://api.x.ai/v1",
@@ -150,6 +160,7 @@ class OllamaAPI:
         self.model_name = model_name
     
     def generate(self, prompt: str) -> str:
+        import ollama
         response = ollama.chat(
             model=self.model_name, 
             messages=[
@@ -174,24 +185,25 @@ class LLMCaller:
         self.use_cache = use_cache
         self.default_model = default_model
 
-        self.models = {
-            "gemini-2.0-flash" : GeminiAPI("gemini-2.0-flash"),
-            "gemini-2.5-flash-preview-04-17" : GeminiAPI("gemini-2.5-flash-preview-04-17"),
-            "gemini-2.5-flash-preview-05-20" : GeminiAPI("gemini-2.5-flash-preview-05-20"),
-            "gemini-2.5-pro-preview-05-06" : GeminiAPI("gemini-2.5-pro-preview-05-06"),
-            "gemini-2.5-flash" : GeminiAPI("gemini-2.5-flash"),
-            "deepseek-v3" : DeepSeekAPI("deepseek-chat"),
-            "deepseek-r1" : DeepSeekAPI("deepseek-reasoner"),
-            "grok-2" : GrokAPI(),
-            "deepseek-r1:32b" : OllamaAPI("deepseek-r1:32b"),
-            "gemma3:27b" : OllamaAPI("gemma3:27b"),
-            "qwen3:32b" : OllamaAPI("qwen3:32b"),
-            "qwen3:8b" : OllamaAPI("qwen3:8b"),
-            "qwen3:4b" : OllamaAPI("qwen3:4b"),
-            "qwen3:4b-instruct" : OllamaAPI("qwen3:4b-instruct"),
-            "kimi-k2-0905-preview" : MoonShotAPI("kimi-k2-0905-preview"),
-            "kimi-k2-turbo-preview" : MoonShotAPI("kimi-k2-turbo-preview"),
+        self.model_factories = {
+            "gemini-2.0-flash" : lambda: GeminiAPI("gemini-2.0-flash"),
+            "gemini-2.5-flash-preview-04-17" : lambda: GeminiAPI("gemini-2.5-flash-preview-04-17"),
+            "gemini-2.5-flash-preview-05-20" : lambda: GeminiAPI("gemini-2.5-flash-preview-05-20"),
+            "gemini-2.5-pro-preview-05-06" : lambda: GeminiAPI("gemini-2.5-pro-preview-05-06"),
+            "gemini-2.5-flash" : lambda: GeminiAPI("gemini-2.5-flash"),
+            "deepseek-v3" : lambda: DeepSeekAPI("deepseek-chat"),
+            "deepseek-r1" : lambda: DeepSeekAPI("deepseek-reasoner"),
+            "grok-2" : lambda: GrokAPI(),
+            "deepseek-r1:32b" : lambda: OllamaAPI("deepseek-r1:32b"),
+            "gemma3:27b" : lambda: OllamaAPI("gemma3:27b"),
+            "qwen3:32b" : lambda: OllamaAPI("qwen3:32b"),
+            "qwen3:8b" : lambda: OllamaAPI("qwen3:8b"),
+            "qwen3:4b" : lambda: OllamaAPI("qwen3:4b"),
+            "qwen3:4b-instruct" : lambda: OllamaAPI("qwen3:4b-instruct"),
+            "kimi-k2-0905-preview" : lambda: MoonShotAPI("kimi-k2-0905-preview"),
+            "kimi-k2-turbo-preview" : lambda: MoonShotAPI("kimi-k2-turbo-preview"),
         }
+        self.models = {}
 
         # Open the database with check_same_thread=False to allow cross-thread usage
         # Use threading lock for thread safety
@@ -205,7 +217,7 @@ class LLMCaller:
         if model_family is None:
             model_family = self.default_model
             
-        model = self.models[model_family]
+        model = self._get_model(model_family)
 
         # Check if the result is already in the database (thread-safe)
         if self.use_cache:
@@ -247,3 +259,43 @@ class LLMCaller:
             return result_json, thinking
         else:
             return result, thinking
+
+    def _get_model(self, model_family: str):
+        if model_family not in self.model_factories:
+            raise KeyError(f"Unknown model family: {model_family}")
+        if model_family not in self.models:
+            self.models[model_family] = self.model_factories[model_family]()
+        return self.models[model_family]
+
+
+def main():
+    """Test function for LLMCaller."""
+    parser = argparse.ArgumentParser(description="Test LLMCaller with a query")
+    parser.add_argument("query", type=str, help="The query to send to the LLM")
+    parser.add_argument("--model", type=str, help="The model to use", default="gemini-2.5-flash")
+    parser.add_argument("--print-thinking", action="store_true", 
+                       help="Print the thinking process if available")
+    
+    args = parser.parse_args()
+    
+    # Create an instance of LLMCaller
+    caller = LLMCaller(use_cache=True, default_model=args.model)
+    
+    print(f"Query: {args.query}\n")
+    print("Generating response...\n")
+    
+    # Call the generate method
+    response, thinking = caller.generate(args.query)
+    
+    # Print out the response
+    print("Response:")
+    print(response)
+    
+    # Print thinking if requested and available
+    if args.print_thinking and thinking:
+        print("\nThinking process:")
+        print(thinking)
+
+
+if __name__ == "__main__":
+    main()
