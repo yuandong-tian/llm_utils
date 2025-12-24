@@ -156,21 +156,60 @@ class GrokAPI:
         return response.choices[0].message.content, ""
 
 class OpenAIAPI:
-    def __init__(self, model_name: str, api_base: str, api_key_env: str = "OPENAI_API_KEY"):
+    def __init__(self, model_name: str, api_base, api_key_env: str = "OPENAI_API_KEY"):
         if not api_base:
             raise RuntimeError("Missing api_base for OpenAI-compatible API.")
-        api_base = api_base.rstrip("/")
-        if not api_base.endswith("/v1"):
-            api_base = f"{api_base}/v1"
-        api_key = get_env_var(api_key_env) or "EMPTY"
-        self.model = OpenAI(
-            api_key=api_key,
+        self.model_name = model_name
+        self.api_key = get_env_var(api_key_env) or "EMPTY"
+        self._api_bases = self._normalize_api_bases(api_base)
+        self._clients = [None] * len(self._api_bases)
+        self._client_idx = 0
+        self._client_lock = threading.Lock()
+
+    def _normalize_api_bases(self, api_base):
+        if isinstance(api_base, (list, tuple)):
+            parts = [str(base).strip() for base in api_base if str(base).strip()]
+        elif isinstance(api_base, str):
+            parts = [part.strip() for part in api_base.split(",") if part.strip()] or [api_base.strip()]
+        else:
+            parts = [str(api_base).strip()]
+
+        normalized = []
+        for base in parts:
+            if not base:
+                continue
+            base = base.rstrip("/")
+            if not base.endswith("/v1"):
+                base = f"{base}/v1"
+            normalized.append(base)
+
+        if not normalized:
+            raise RuntimeError("Missing api_base for OpenAI-compatible API.")
+        return normalized
+
+    def _build_client(self, api_base: str):
+        return OpenAI(
+            api_key=self.api_key,
             base_url=api_base,
         )
-        self.model_name = model_name
+
+    def _get_client(self):
+        if len(self._api_bases) == 1:
+            if self._clients[0] is None:
+                self._clients[0] = self._build_client(self._api_bases[0])
+            return self._clients[0]
+
+        with self._client_lock:
+            idx = self._client_idx
+            self._client_idx = (self._client_idx + 1) % len(self._api_bases)
+
+        if self._clients[idx] is None:
+            self._clients[idx] = self._build_client(self._api_bases[idx])
+        return self._clients[idx]
 
     def generate(self, prompt: str) -> str:
-        response = self.model.chat.completions.create(
+        client = self._get_client()
+        response = client.chat.completions.create(
             model=self.model_name,
             messages=[
                 {"role": "user", "content": prompt},
