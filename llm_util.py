@@ -163,8 +163,9 @@ class OpenAIAPI:
         self.api_key = get_env_var(api_key_env) or "EMPTY"
         self._api_bases = self._normalize_api_bases(api_base)
         self._clients = [None] * len(self._api_bases)
-        self._client_idx = 0
-        self._client_lock = threading.Lock()
+        self._idle_lock = threading.Lock()
+        self._busy_flags = [False] * len(self._api_bases)
+        self._idle_cond = threading.Condition(self._idle_lock)
 
     def _normalize_api_bases(self, api_base):
         if isinstance(api_base, (list, tuple)):
@@ -193,29 +194,44 @@ class OpenAIAPI:
             base_url=api_base,
         )
 
-    def _get_client(self):
+    def generate(self, prompt: str) -> str:
         if len(self._api_bases) == 1:
             if self._clients[0] is None:
                 self._clients[0] = self._build_client(self._api_bases[0])
-            return self._clients[0]
+            client = self._clients[0]
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content, ""
 
-        with self._client_lock:
-            idx = self._client_idx
-            self._client_idx = (self._client_idx + 1) % len(self._api_bases)
+        with self._idle_cond:
+            while True:
+                idle_indices = [i for i, busy in enumerate(self._busy_flags) if not busy]
+                if idle_indices:
+                    idx = idle_indices[0]
+                    self._busy_flags[idx] = True
+                    break
+                self._idle_cond.wait()
 
-        if self._clients[idx] is None:
-            self._clients[idx] = self._build_client(self._api_bases[idx])
-        return self._clients[idx]
+            if self._clients[idx] is None:
+                self._clients[idx] = self._build_client(self._api_bases[idx])
+            client = self._clients[idx]
 
-    def generate(self, prompt: str) -> str:
-        client = self._get_client()
-        response = client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return response.choices[0].message.content, ""
+        try:
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content, ""
+        finally:
+            with self._idle_cond:
+                self._busy_flags[idx] = False
+                self._idle_cond.notify()
 
 class OllamaAPI:
     def __init__(self, model_name: str = "deepseek-r1:32b"):
