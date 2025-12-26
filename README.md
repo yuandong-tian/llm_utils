@@ -30,6 +30,23 @@ caller = LLMCaller(default_model="local-model", api_base="http://localhost:30000
 response, thinking = caller.generate("Hello", model_family="openai-api")
 ```
 
+## OpenAI Router (Load Balancing)
+
+`llm_router.py` exposes an OpenAI-compatible `/v1/chat/completions` endpoint and
+load balances across multiple backends using least-busy routing.
+
+```bash
+python llm_router.py \
+  --upstreams http://worker-0:30000-30007 \
+  --port 8001
+```
+
+Then point your client at the router:
+
+```bash
+export LLM_API_BASE=http://localhost:8001
+```
+
 ## Environment
 
 `llm_util.py` will read `../config/bashrc` for keys if they are not already in the environment.
