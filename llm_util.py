@@ -156,7 +156,7 @@ class GrokAPI:
         return response.choices[0].message.content, ""
 
 class OpenAIAPI:
-    def __init__(self, model_name: str, api_base, api_key_env: str = "OPENAI_API_KEY"):
+    def __init__(self, model_name: str, api_base = "https://api.openai.com", api_key_env: str = "OPENAI_API_KEY"):
         if not api_base:
             raise RuntimeError("Missing api_base for OpenAI-compatible API.")
         self.model_name = model_name
@@ -270,6 +270,11 @@ class LLMCaller:
             "gemini-2.5-flash-preview-05-20" : lambda: GeminiAPI("gemini-2.5-flash-preview-05-20"),
             "gemini-2.5-pro-preview-05-06" : lambda: GeminiAPI("gemini-2.5-pro-preview-05-06"),
             "gemini-2.5-flash" : lambda: GeminiAPI("gemini-2.5-flash"),
+            "gpt-5.1" : lambda: OpenAIAPI("gpt-5.1"),
+            "gpt-5-mini" : lambda: OpenAIAPI("gpt-5-mini"),
+            "gpt-5-nano" : lambda: OpenAIAPI("gpt-5-nano"),
+            "o3" : lambda: OpenAIAPI("o3"),
+            "o4-mini" : lambda: OpenAIAPI("o4-mini"),
             "deepseek-v3" : lambda: DeepSeekAPI("deepseek-chat"),
             "deepseek-r1" : lambda: DeepSeekAPI("deepseek-reasoner"),
             "grok-2" : lambda: GrokAPI(),
