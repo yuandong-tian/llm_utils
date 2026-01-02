@@ -1,5 +1,6 @@
 import random
 import asyncio
+import base64
 import tolerantjson
 from google import genai
 from openai import OpenAI
@@ -175,27 +176,160 @@ class GrokAPI:
         return response.choices[0].message.content, ""
 
 class OpenAIAPI:
-    def __init__(self, model_name: str, api_base: str, api_key_env: str = "OPENAI_API_KEY"):
+    def __init__(self, model_name: str, api_base = "https://api.openai.com", api_key_env: str = "OPENAI_API_KEY"):
         if not api_base:
             raise RuntimeError("Missing api_base for OpenAI-compatible API.")
-        api_base = api_base.rstrip("/")
-        if not api_base.endswith("/v1"):
-            api_base = f"{api_base}/v1"
-        api_key = get_env_var(api_key_env) or "EMPTY"
-        self.model = OpenAI(
-            api_key=api_key,
+        self.model_name = model_name
+        self.api_key = get_env_var(api_key_env) or "EMPTY"
+        self._api_bases = self._normalize_api_bases(api_base)
+        self._clients = [None] * len(self._api_bases)
+        self._idle_lock = threading.Lock()
+        self._busy_flags = [False] * len(self._api_bases)
+        self._idle_cond = threading.Condition(self._idle_lock)
+
+    def _normalize_api_bases(self, api_base):
+        if isinstance(api_base, (list, tuple)):
+            parts = [str(base).strip() for base in api_base if str(base).strip()]
+        elif isinstance(api_base, str):
+            parts = [part.strip() for part in api_base.split(",") if part.strip()] or [api_base.strip()]
+        else:
+            parts = [str(api_base).strip()]
+
+        normalized = []
+        for base in parts:
+            if not base:
+                continue
+            base = base.rstrip("/")
+            if not base.endswith("/v1"):
+                base = f"{base}/v1"
+            normalized.append(base)
+
+        if not normalized:
+            raise RuntimeError("Missing api_base for OpenAI-compatible API.")
+        return normalized
+
+    def _build_client(self, api_base: str):
+        return OpenAI(
+            api_key=self.api_key,
             base_url=api_base,
         )
-        self.model_name = model_name
+
+    def _ensure_api_key(self) -> None:
+        if not self.api_key or self.api_key == "EMPTY":
+            raise RuntimeError("Missing OPENAI_API_KEY for OpenAI-compatible API.")
+
+    def _encode_image(self, path: str) -> str:
+        with open(path, "rb") as handle:
+            return base64.b64encode(handle.read()).decode("utf-8")
+
+    def _build_image_messages(self, prompt: str, image_paths: list[str]) -> list[dict]:
+        content = [{"type": "text", "text": prompt}]
+        for path in image_paths:
+            image_b64 = self._encode_image(path)
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                }
+            )
+        return [{"role": "user", "content": content}]
 
     def generate(self, prompt: str) -> str:
-        response = self.model.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return response.choices[0].message.content, ""
+        if len(self._api_bases) == 1:
+            if self._clients[0] is None:
+                self._clients[0] = self._build_client(self._api_bases[0])
+            client = self._clients[0]
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content, ""
+
+        with self._idle_cond:
+            while True:
+                idle_indices = [i for i, busy in enumerate(self._busy_flags) if not busy]
+                if idle_indices:
+                    idx = idle_indices[0]
+                    self._busy_flags[idx] = True
+                    break
+                self._idle_cond.wait()
+
+            if self._clients[idx] is None:
+                self._clients[idx] = self._build_client(self._api_bases[idx])
+            client = self._clients[idx]
+
+        try:
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content, ""
+        finally:
+            with self._idle_cond:
+                self._busy_flags[idx] = False
+                self._idle_cond.notify()
+
+    def generate_with_images(self, prompt: str, image_paths: list[str], max_tokens: int = 800) -> str:
+        self._ensure_api_key()
+        if len(self._api_bases) == 1:
+            if self._clients[0] is None:
+                self._clients[0] = self._build_client(self._api_bases[0])
+            client = self._clients[0]
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=self._build_image_messages(prompt, image_paths),
+                max_completion_tokens=max_tokens,
+            )
+            return response.choices[0].message.content, ""
+
+        with self._idle_cond:
+            while True:
+                idle_indices = [i for i, busy in enumerate(self._busy_flags) if not busy]
+                if idle_indices:
+                    idx = idle_indices[0]
+                    self._busy_flags[idx] = True
+                    break
+                self._idle_cond.wait()
+
+            if self._clients[idx] is None:
+                self._clients[idx] = self._build_client(self._api_bases[idx])
+            client = self._clients[idx]
+
+        try:
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=self._build_image_messages(prompt, image_paths),
+                max_completion_tokens=max_tokens,
+            )
+            return response.choices[0].message.content, ""
+        finally:
+            with self._idle_cond:
+                self._busy_flags[idx] = False
+                self._idle_cond.notify()
+
+
+def get_default_api_base(model_name: str) -> str | None:
+    if not model_name:
+        return None
+    name = model_name.strip().lower()
+
+    rules = [
+        ("https://api.openai.com/v1", ("gpt-", "o3", "o4-")),
+        ("https://api.moonshot.ai/v1", ("kimi-",)),
+        ("https://api.deepseek.com/v1", ("deepseek-",)),
+        ("https://api.x.ai/v1", ("grok-",)),
+    ]
+
+    for api_base, prefixes in rules:
+        for prefix in prefixes:
+            if name.startswith(prefix):
+                return api_base
+    return None
+
 
 class OllamaAPI:
     def __init__(self, model_name: str = "deepseek-r1:32b"):
@@ -223,10 +357,17 @@ class OllamaAPI:
         
 
 class LLMCaller:
-    def __init__(self, use_cache: bool = True, default_model: str = "gemini-2.5-flash", api_base: str = None):
+    def __init__(
+        self,
+        use_cache: bool = True,
+        default_model: str = "gemini-2.5-flash",
+        api_base: str = None,
+        api_key_env: str = "OPENAI_API_KEY",
+    ):
         self.use_cache = use_cache
         self.default_model = default_model
         self.api_base = api_base
+        self.api_key_env = api_key_env
 
         self.model_factories = {
             "gemini-2.0-flash" : lambda: GeminiAPI("gemini-2.0-flash"),
@@ -234,10 +375,19 @@ class LLMCaller:
             "gemini-2.5-flash-preview-05-20" : lambda: GeminiAPI("gemini-2.5-flash-preview-05-20"),
             "gemini-2.5-pro-preview-05-06" : lambda: GeminiAPI("gemini-2.5-pro-preview-05-06"),
             "gemini-2.5-flash" : lambda: GeminiAPI("gemini-2.5-flash"),
+            "gpt-5.1" : lambda: OpenAIAPI("gpt-5.1"),
+            "gpt-5-mini" : lambda: OpenAIAPI("gpt-5-mini"),
+            "gpt-5-nano" : lambda: OpenAIAPI("gpt-5-nano"),
+            "o3" : lambda: OpenAIAPI("o3"),
+            "o4-mini" : lambda: OpenAIAPI("o4-mini"),
             "deepseek-v3" : lambda: DeepSeekAPI("deepseek-chat"),
             "deepseek-r1" : lambda: DeepSeekAPI("deepseek-reasoner"),
             "grok-2" : lambda: GrokAPI(),
-            "openai-api" : lambda: OpenAIAPI(self.default_model, api_base=self.api_base),
+            "openai-api" : lambda: OpenAIAPI(
+                self.default_model,
+                api_base=self.api_base,
+                api_key_env=self.api_key_env,
+            ),
             "deepseek-r1:32b" : lambda: OllamaAPI("deepseek-r1:32b"),
             "gemma3:27b" : lambda: OllamaAPI("gemma3:27b"),
             "qwen3:32b" : lambda: OllamaAPI("qwen3:32b"),
@@ -271,6 +421,48 @@ class LLMCaller:
             )
         raise RuntimeError("LLMCaller.generate cannot run inside an event loop. Use generate_async instead.")
 
+    def generate_with_images(
+        self,
+        prompt: str,
+        image_paths: list[str],
+        model_family: str = None,
+        max_tokens: int = 800,
+    ) -> str:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.generate_with_images_async(
+                    prompt,
+                    image_paths=image_paths,
+                    model_family=model_family,
+                    max_tokens=max_tokens,
+                )
+            )
+        raise RuntimeError(
+            "LLMCaller.generate_with_images cannot run inside an event loop. "
+            "Use generate_with_images_async instead."
+        )
+
+    async def generate_with_images_async(
+        self,
+        prompt: str,
+        image_paths: list[str],
+        model_family: str = None,
+        max_tokens: int = 800,
+    ) -> str:
+        if model_family is None:
+            model_family = self.default_model
+        model = self._get_model(model_family)
+        if not hasattr(model, "generate_with_images"):
+            raise RuntimeError(f"Model family {model_family} does not support images.")
+        result, thinking = await asyncio.to_thread(
+            model.generate_with_images,
+            prompt,
+            image_paths,
+            max_tokens,
+        )
+        return result, thinking
     async def generate_async(self, prompt: str, model_family: str = None, parse_json: bool = False, max_retries: int = 3) -> str:
         if model_family is None:
             model_family = self.default_model

@@ -1,3 +1,6 @@
 tolerantjson
 google-genai
 openai
+fastapi
+uvicorn
+httpx
