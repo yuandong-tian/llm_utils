@@ -12,6 +12,12 @@ import sqlite3
 import subprocess
 import threading
 
+DEFAULT_TRANSCRIBE_PROMPT = (
+    "Transcribe this audio clip. The audio clip can be either in English or in "
+    "Simplified Chinese, keep the language when outputting. "
+    "When outputting Chinese, output Simplified Chinese rather than Traditional Chinese."
+)
+
 def load_bash_env(bashrc_path: str = None) -> None:
     """Loads environment variables from a bashrc file into os.environ."""
     if bashrc_path is None:
@@ -81,7 +87,7 @@ class MoonShotAPI:
         return response.choices[0].message.content.strip(), ""
 
 class GeminiAPI:
-    def __init__(self, model_name: str = "gemini-2.0-flash", use_key_rotation: bool = True):
+    def __init__(self, model_name: str = "gemini-2.5-flash", use_key_rotation: bool = True):
         ENV_KEYS = ['GEMINI_API_KEY', 'GEMINI_API_KEY2', 'GEMINI_API_KEY3']
         # Randomly pick one of the API keys
         if use_key_rotation:
@@ -102,6 +108,19 @@ class GeminiAPI:
         )
         # No thinking process for Gemini
         return result.text.strip(), ""
+
+
+def transcribe_audio_gemini(audio_path: str, model: str = "gemini-2.5-flash") -> str:
+    api_key = get_env_var("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY for Gemini transcription.")
+    client = genai.Client(api_key=api_key)
+    gemini_file = client.files.upload(file=audio_path)
+    response = client.models.generate_content(
+        model=model,
+        contents=[DEFAULT_TRANSCRIBE_PROMPT, gemini_file],
+    )
+    return response.text.strip()
     
     
 class DeepSeekAPI:
