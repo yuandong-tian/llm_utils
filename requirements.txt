@@ -4,3 +4,4 @@ openai
 fastapi
 uvicorn
 httpx
+ollama

@@ -1,3 +1,14 @@
+"""OpenAI-compatible load balancing router.
+
+Routes requests to multiple upstream LLM servers using least-busy selection.
+Supports port range expansion (e.g., http://worker:30000-30007) and automatic
+health probing on startup.
+
+Usage:
+    python llm_router.py --upstreams "http://server1:8000,http://server2:8000"
+    python llm_router.py --upstreams "http://worker:30000-30007"
+"""
+
 import argparse
 import asyncio
 import json
@@ -49,6 +60,8 @@ def _parse_upstreams(value: Optional[str]) -> List[str]:
 
 
 class LeastBusyRouter:
+    """Thread-safe router that directs requests to the least-busy upstream server."""
+
     def __init__(self, upstreams: List[str]):
         self._upstreams = upstreams
         self._in_flight = [0] * len(upstreams)

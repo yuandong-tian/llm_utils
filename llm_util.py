@@ -1,17 +1,23 @@
-import random
+# Standard library imports
+import argparse
 import asyncio
 import base64
-import tolerantjson
-from google import genai
-from openai import OpenAI
 import os
+import random
 import re
-import argparse
-
-# create a database to store the results of LLM calls
 import sqlite3
 import subprocess
 import threading
+
+# Third-party imports
+from google import genai
+from openai import OpenAI
+import tolerantjson
+
+try:
+    import ollama
+except ImportError:
+    ollama = None
 
 DEFAULT_TRANSCRIBE_PROMPT = (
     "Transcribe this audio clip. The audio clip can be either in English or in "
@@ -66,6 +72,11 @@ if not os.path.exists(DB_FILE):
     conn.close()
 
 class MoonShotAPI:
+    """API wrapper for Moonshot AI (Kimi) models.
+
+    Requires KIMI_API_KEY environment variable.
+    """
+
     def __init__(self, model_name: str = "kimi-k2-0905-preview"):
         if not get_env_var("KIMI_API_KEY"):
             raise RuntimeError("Missing KIMI_API_KEY for MoonShot API.")
@@ -88,6 +99,12 @@ class MoonShotAPI:
         return response.choices[0].message.content.strip(), ""
 
 class GeminiAPI:
+    """API wrapper for Google Gemini models.
+
+    Supports key rotation across multiple API keys (GEMINI_API_KEY, GEMINI_API_KEY2, GEMINI_API_KEY3)
+    to distribute load and avoid rate limits.
+    """
+
     def __init__(self, model_name: str = "gemini-2.5-flash", use_key_rotation: bool = True):
         ENV_KEYS = ['GEMINI_API_KEY', 'GEMINI_API_KEY2', 'GEMINI_API_KEY3']
         # Randomly pick one of the API keys
@@ -98,7 +115,6 @@ class GeminiAPI:
         api_key = get_env_var(env_key)
         if not api_key:
             raise RuntimeError(f"Missing {env_key} for Gemini API.")
-        print(f"Using Gemini API key: {env_key}")
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
@@ -125,6 +141,13 @@ def transcribe_audio_gemini(audio_path: str, model: str = "gemini-2.5-flash") ->
     
     
 class DeepSeekAPI:
+    """API wrapper for DeepSeek models.
+
+    Supports both deepseek-chat and deepseek-reasoner models.
+    The reasoner model returns thinking/reasoning content alongside the response.
+    Requires DEEPSEEK_TOKEN environment variable.
+    """
+
     def __init__(self, model_name: str = "deepseek-reasoner"):
         if not get_env_var("DEEPSEEK_TOKEN"):
             raise RuntimeError("Missing DEEPSEEK_TOKEN for DeepSeek API.")
@@ -149,6 +172,11 @@ class DeepSeekAPI:
         return result, thinking
 
 class GrokAPI:
+    """API wrapper for xAI Grok models.
+
+    Requires XAI_API_KEY_X environment variable.
+    """
+
     def __init__(self, model_name: str = "grok-2-latest"):
         if not get_env_var("XAI_API_KEY_X"):
             raise RuntimeError("Missing XAI_API_KEY_X for Grok API.")
@@ -176,7 +204,14 @@ class GrokAPI:
         return response.choices[0].message.content, ""
 
 class OpenAIAPI:
-    def __init__(self, model_name: str, api_base = "https://api.openai.com", api_key_env: str = "OPENAI_API_KEY"):
+    """API wrapper for OpenAI and OpenAI-compatible endpoints.
+
+    Supports multiple API base URLs for load balancing across servers.
+    Pass comma-separated URLs or a list to api_base for multi-backend support.
+    Thread-safe with automatic client pooling.
+    """
+
+    def __init__(self, model_name: str, api_base: str = "https://api.openai.com", api_key_env: str = "OPENAI_API_KEY"):
         if not api_base:
             raise RuntimeError("Missing api_base for OpenAI-compatible API.")
         self.model_name = model_name
@@ -332,11 +367,18 @@ def get_default_api_base(model_name: str) -> str | None:
 
 
 class OllamaAPI:
+    """API wrapper for local Ollama models.
+
+    Supports models like deepseek-r1, gemma3, qwen3, etc. running locally via Ollama.
+    Automatically extracts thinking content from <think> tags if present.
+    """
+
     def __init__(self, model_name: str = "deepseek-r1:32b"):
+        if ollama is None:
+            raise ImportError("ollama package is not installed. Run: pip install ollama")
         self.model_name = model_name
-    
+
     def generate(self, prompt: str) -> str:
-        import ollama
         response = ollama.chat(
             model=self.model_name, 
             messages=[
@@ -357,6 +399,18 @@ class OllamaAPI:
         
 
 class LLMCaller:
+    """Unified interface for calling multiple LLM providers with caching.
+
+    Supports Gemini, OpenAI, DeepSeek, Grok, Moonshot, and local Ollama models.
+    Results are cached in a SQLite database to avoid redundant API calls.
+
+    Args:
+        use_cache: Whether to cache and reuse previous responses.
+        default_model: Default model to use when none is specified.
+        api_base: Base URL for OpenAI-compatible endpoints.
+        api_key_env: Environment variable name for the API key.
+    """
+
     def __init__(
         self,
         use_cache: bool = True,
@@ -480,11 +534,12 @@ class LLMCaller:
                     return self.cursor.fetchone()
 
             result = await asyncio.to_thread(_read_cache)
-            if result:
-                assert parse_json == result[2], f"Parse JSON flag mismatch: {parse_json} != {result[2]}"
+            if result and parse_json == result[2]:
+                # Cache hit with matching parse_json flag
                 if parse_json:
                     return tolerantjson.tolerate(result[0]), result[1]
                 return result[0], result[1]
+            # If parse_json flag doesn't match, regenerate
 
         # If the result is not in the database, or we are not in deterministic mode, generate it
         last_error = None
