@@ -15,7 +15,7 @@ import json
 import os
 import re
 import threading
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 import httpx
 import uvicorn
@@ -60,22 +60,37 @@ def _parse_upstreams(value: Optional[str]) -> List[str]:
 
 
 class LeastBusyRouter:
-    """Thread-safe router that directs requests to the least-busy upstream server."""
+    """Thread-safe router that directs requests to the least-busy upstream server.
 
-    def __init__(self, upstreams: List[str]):
+    Supports model-aware routing: if a model_map is provided, only backends
+    that serve the requested model are considered.
+    """
+
+    def __init__(self, upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None):
         self._upstreams = upstreams
         self._in_flight = [0] * len(upstreams)
         self._lock = threading.Lock()
+        # model_name -> list of upstream indices that serve it
+        self._model_map = model_map or {}
 
-    def acquire_backend(self, exclude: Optional[set] = None) -> int:
+    def acquire_backend(self, exclude: Optional[set] = None, model: Optional[str] = None) -> int:
         with self._lock:
+            # If model specified and we have a mapping, restrict to those backends
+            allowed = None
+            if model and self._model_map:
+                allowed = set(self._model_map.get(model, []))
+                if not allowed:
+                    # Model not found in map; fall back to all backends
+                    allowed = None
+
             candidates = [
                 (idx, count)
                 for idx, count in enumerate(self._in_flight)
-                if not exclude or idx not in exclude
+                if (not exclude or idx not in exclude)
+                and (allowed is None or idx in allowed)
             ]
             if not candidates:
-                raise RuntimeError("No available upstreams.")
+                raise RuntimeError(f"No available upstreams for model '{model}'.")
             idx, _ = min(candidates, key=lambda item: item[1])
             self._in_flight[idx] += 1
             return idx
@@ -84,46 +99,106 @@ class LeastBusyRouter:
         with self._lock:
             self._in_flight[idx] = max(0, self._in_flight[idx] - 1)
 
+    def backends_for_model(self, model: str) -> List[int]:
+        """Return upstream indices that serve a given model."""
+        if self._model_map:
+            return self._model_map.get(model, list(range(len(self._upstreams))))
+        return list(range(len(self._upstreams)))
+
     @property
     def upstreams(self) -> List[str]:
         return self._upstreams
 
+    @property
+    def model_map(self) -> Dict[str, List[int]]:
+        return self._model_map
 
-def _probe_upstreams(upstreams: List[str]) -> List[str]:
+    @property
+    def all_models(self) -> List[str]:
+        return sorted(self._model_map.keys())
+
+
+def _probe_upstreams(upstreams: List[str]):
+    """Probe upstreams, discover models. Returns (healthy_upstreams, model_map)."""
     healthy = []
+    # model_name -> list of indices into the healthy list
+    model_map: Dict[str, List[int]] = {}
+
     with httpx.Client(timeout=5.0) as client:
         for upstream in upstreams:
             try:
                 response = client.get(f"{upstream}/models")
                 if response.status_code < 500:
+                    idx = len(healthy)
                     healthy.append(upstream)
-                    print(f"[router] Upstream OK: {upstream}")
+                    # Parse models from response
+                    models = []
+                    try:
+                        data = response.json()
+                        for m in data.get("data", []):
+                            mid = m.get("id", "")
+                            if mid:
+                                models.append(mid)
+                    except Exception:
+                        pass
+                    if models:
+                        print(f"[router] Upstream OK: {upstream} -> models: {models}")
+                        for mid in models:
+                            model_map.setdefault(mid, []).append(idx)
+                    else:
+                        print(f"[router] Upstream OK: {upstream} (no models discovered)")
                 else:
                     print(f"[router] Upstream error {response.status_code}: {upstream}")
             except httpx.RequestError as exc:
                 print(f"[router] Upstream unreachable: {upstream} ({exc})")
-    return healthy
+
+    return healthy, model_map
 
 
-def create_app(upstreams: List[str]) -> FastAPI:
-    router = LeastBusyRouter(upstreams)
+def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None) -> FastAPI:
+    router = LeastBusyRouter(upstreams, model_map=model_map)
     app = FastAPI()
+
+    if model_map:
+        print(f"[router] Model routing table:")
+        for model, indices in sorted(model_map.items()):
+            backends = [upstreams[i] for i in indices]
+            print(f"  {model} -> {backends}")
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         payload = await request.json()
+        model = payload.get("model")
         headers = {
             key: value
             for key, value in request.headers.items()
             if key.lower() not in {"host", "content-length"}
         }
 
+        # Check if model is known
+        if model and router.model_map and model not in router.model_map:
+            error_body = {
+                "error": {
+                    "message": f"Model '{model}' not found. Available: {router.all_models}",
+                    "type": "invalid_request_error",
+                }
+            }
+            return Response(
+                content=json.dumps(error_body),
+                status_code=404,
+                media_type="application/json",
+            )
+
         last_error = None
         tried = set()
+        num_candidates = len(router.backends_for_model(model)) if model else len(router.upstreams)
 
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for _ in range(len(router.upstreams)):
-                idx = router.acquire_backend(exclude=tried)
+            for _ in range(num_candidates):
+                try:
+                    idx = router.acquire_backend(exclude=tried, model=model)
+                except RuntimeError:
+                    break
                 backend = router.upstreams[idx]
                 tried.add(idx)
                 try:
@@ -151,6 +226,25 @@ def create_app(upstreams: List[str]) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
+        # If we have a model map, return the aggregated list directly
+        if router.model_map:
+            model_list = []
+            for model_id in router.all_models:
+                backend_indices = router.model_map[model_id]
+                model_list.append({
+                    "id": model_id,
+                    "object": "model",
+                    "owned_by": "router",
+                    "backends": len(backend_indices),
+                })
+            body = {"object": "list", "data": model_list}
+            return Response(
+                content=json.dumps(body),
+                status_code=200,
+                media_type="application/json",
+            )
+
+        # Fallback: proxy to a backend
         headers = {
             key: value
             for key, value in request.headers.items()
@@ -257,12 +351,14 @@ def main():
         return
 
     upstreams = _parse_upstreams(args.upstreams)
-    healthy = _probe_upstreams(upstreams)
+    healthy, model_map = _probe_upstreams(upstreams)
     if not healthy:
         raise RuntimeError("No healthy upstreams available; aborting router startup.")
     if len(healthy) < len(upstreams):
         print("[router] Some upstreams are unhealthy and will be skipped.")
-    app = create_app(healthy)
+    if model_map:
+        print(f"[router] Discovered {len(model_map)} model(s) across {len(healthy)} backend(s)")
+    app = create_app(healthy, model_map=model_map)
 
     uvicorn.run(app, host=args.listen, port=args.port)
 
