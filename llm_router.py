@@ -15,6 +15,7 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Dict, List, Optional, Set
 
 import httpx
@@ -59,63 +60,158 @@ def _parse_upstreams(value: Optional[str]) -> List[str]:
     return normalized
 
 
-class LeastBusyRouter:
-    """Thread-safe router that directs requests to the least-busy upstream server.
+class _RouterSnapshot:
+    """Immutable snapshot of router state, captured at acquire time.
 
-    Supports model-aware routing: if a model_map is provided, only backends
-    that serve the requested model are considered.
+    In-flight requests hold a reference to their snapshot so hot-reloads
+    don't corrupt them.
+    """
+    __slots__ = ("upstreams", "in_flight", "model_map", "ema_latency", "last_update")
+
+    def __init__(self, upstreams: List[str], model_map: Dict[str, List[int]]):
+        self.upstreams = upstreams
+        self.in_flight = [0] * len(upstreams)
+        self.model_map = model_map
+        self.ema_latency = [0.0] * len(upstreams)
+        self.last_update = [0.0] * len(upstreams)  # monotonic timestamps
+
+
+class LeastBusyRouter:
+    """Thread-safe router with model-aware routing and safe hot-reload.
+
+    Uses a snapshot pattern: each acquire() captures the current state so
+    that a reload() during an in-flight request cannot cause index errors
+    or route to the wrong backend.
     """
 
-    def __init__(self, upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None):
-        self._upstreams = upstreams
-        self._in_flight = [0] * len(upstreams)
-        self._lock = threading.Lock()
-        # model_name -> list of upstream indices that serve it
-        self._model_map = model_map or {}
+    _ema_alpha = 0.3
+    _decay_half_life = 60.0  # seconds: EMA decays halfway to mean after this long idle
 
-    def acquire_backend(self, exclude: Optional[set] = None, model: Optional[str] = None) -> int:
+    def __init__(self, upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None):
+        self._lock = threading.Lock()
+        self._snap = _RouterSnapshot(upstreams, model_map or {})
+
+    def acquire_backend(self, exclude: Optional[set] = None,
+                        model: Optional[str] = None) -> tuple:
+        """Acquire the least-busy backend. Returns (handle, backend_url).
+
+        The handle must be passed to release_backend() when done.
+        """
         with self._lock:
-            # If model specified and we have a mapping, restrict to those backends
+            snap = self._snap
             allowed = None
-            if model and self._model_map:
-                allowed = set(self._model_map.get(model, []))
+            if model and snap.model_map:
+                allowed = set(snap.model_map.get(model, []))
                 if not allowed:
-                    # Model not found in map; fall back to all backends
                     allowed = None
 
             candidates = [
                 (idx, count)
-                for idx, count in enumerate(self._in_flight)
+                for idx, count in enumerate(snap.in_flight)
                 if (not exclude or idx not in exclude)
                 and (allowed is None or idx in allowed)
             ]
             if not candidates:
                 raise RuntimeError(f"No available upstreams for model '{model}'.")
-            idx, _ = min(candidates, key=lambda item: item[1])
-            self._in_flight[idx] += 1
-            return idx
 
-    def release_backend(self, idx: int) -> None:
+            # Decay EMAs toward the mean for idle backends
+            now = time.monotonic()
+            active = [(idx, snap.ema_latency[idx]) for idx, _ in candidates
+                      if snap.ema_latency[idx] > 0]
+            if active:
+                mean_lat = sum(v for _, v in active) / len(active)
+                hl = self._decay_half_life
+                decayed = {}
+                for idx, _ in candidates:
+                    ema = snap.ema_latency[idx]
+                    if ema > 0 and snap.last_update[idx] > 0:
+                        age = now - snap.last_update[idx]
+                        factor = 0.5 ** (age / hl)
+                        decayed[idx] = mean_lat + (ema - mean_lat) * factor
+                    else:
+                        decayed[idx] = 0.0
+                # score = (in_flight + 1) * (latency + 0.001)
+                # +0.001 floor: latency is a tiebreaker, not a starve signal
+                idx, _ = min(candidates,
+                             key=lambda item: (item[1] + 1) * (decayed[item[0]] + 0.001))
+            else:
+                idx, _ = min(candidates, key=lambda item: item[1])
+            snap.in_flight[idx] += 1
+            return (snap, idx), snap.upstreams[idx]
+
+    def release_backend(self, handle) -> None:
+        """Release a backend acquired via acquire_backend()."""
+        snap, idx = handle
         with self._lock:
-            self._in_flight[idx] = max(0, self._in_flight[idx] - 1)
+            if idx < len(snap.in_flight):
+                snap.in_flight[idx] = max(0, snap.in_flight[idx] - 1)
+
+    def report_latency(self, handle, seconds: float, tokens: int = 0) -> None:
+        """Update EMA per-token latency for a backend after a successful request.
+
+        Args:
+            handle: The handle from acquire_backend().
+            seconds: Wall-clock time for the request.
+            tokens: Total tokens from the response usage field. If 0,
+                    the raw seconds are used (e.g. for /models requests).
+        """
+        snap, idx = handle
+        sample = seconds / max(tokens, 1) if tokens > 0 else seconds
+        alpha = self._ema_alpha
+        with self._lock:
+            if idx < len(snap.ema_latency):
+                old = snap.ema_latency[idx]
+                if old == 0.0:
+                    snap.ema_latency[idx] = sample
+                else:
+                    snap.ema_latency[idx] = alpha * sample + (1 - alpha) * old
+                snap.last_update[idx] = time.monotonic()
+
+    def reload(self, new_upstreams: List[str],
+               new_model_map: Optional[Dict[str, List[int]]] = None) -> None:
+        """Hot-reload backends. In-flight requests on old snapshots are unaffected."""
+        with self._lock:
+            old_snap = self._snap
+            new_snap = _RouterSnapshot(new_upstreams, new_model_map or {})
+            # Carry over EMA values for backends that persist
+            old_url_to_data = {
+                url: (old_snap.ema_latency[i], old_snap.last_update[i])
+                for i, url in enumerate(old_snap.upstreams)
+            }
+            for i, url in enumerate(new_snap.upstreams):
+                if url in old_url_to_data:
+                    new_snap.ema_latency[i] = old_url_to_data[url][0]
+                    new_snap.last_update[i] = old_url_to_data[url][1]
+            self._snap = new_snap
 
     def backends_for_model(self, model: str) -> List[int]:
         """Return upstream indices that serve a given model."""
-        if self._model_map:
-            return self._model_map.get(model, list(range(len(self._upstreams))))
-        return list(range(len(self._upstreams)))
+        snap = self._snap
+        if snap.model_map:
+            return snap.model_map.get(model, list(range(len(snap.upstreams))))
+        return list(range(len(snap.upstreams)))
 
     @property
     def upstreams(self) -> List[str]:
-        return self._upstreams
+        return self._snap.upstreams
 
     @property
     def model_map(self) -> Dict[str, List[int]]:
-        return self._model_map
+        return self._snap.model_map
 
     @property
     def all_models(self) -> List[str]:
-        return sorted(self._model_map.keys())
+        return sorted(self._snap.model_map.keys())
+
+    @property
+    def _in_flight(self):
+        """Expose in_flight for /admin/status."""
+        return self._snap.in_flight
+
+    @property
+    def _ema_latency(self):
+        """Expose ema_latency for /admin/status."""
+        return self._snap.ema_latency
 
 
 def _probe_upstreams(upstreams: List[str]):
@@ -155,7 +251,84 @@ def _probe_upstreams(upstreams: List[str]):
     return healthy, model_map
 
 
-def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None) -> FastAPI:
+def _discover_from_squeue() -> tuple:
+    """Auto-discover upstream URLs from running squeue jobs.
+
+    Tries to import cluster_utils for get_jobs/get_port_from_log.
+    Returns (healthy, model_map) or ([], {}) if unavailable.
+    """
+    try:
+        import subprocess
+        # Try to find cluster_utils
+        import importlib
+        import sys
+        # Search common locations
+        for path in [
+            os.path.expanduser("~/test_cluster/yuandong"),
+            os.path.dirname(os.path.abspath(__file__)),
+        ]:
+            if path not in sys.path:
+                sys.path.insert(0, path)
+        from cluster_utils import get_jobs, get_port_from_log
+    except ImportError:
+        print("[router] cluster_utils not found, cannot auto-discover from squeue")
+        return [], {}
+
+    jobs = get_jobs()
+    urls = []
+    for job in jobs:
+        if job.get("state") != "RUNNING":
+            continue
+        port = get_port_from_log(job["job_id"])
+        if port:
+            urls.append(f"http://{job['node']}:{port}/v1")
+
+    if not urls:
+        return [], {}
+
+    return _probe_upstreams(urls)
+
+
+def _filter_by_models(
+    healthy: List[str],
+    model_map: Dict[str, List[int]],
+    upstream_models: Optional[Set[str]],
+) -> tuple:
+    """Filter backends and model_map to only include covered models.
+
+    Returns (filtered_upstreams, filtered_model_map) with re-indexed indices.
+    """
+    if not upstream_models or not model_map:
+        return healthy, model_map
+
+    # Find indices of backends that serve at least one covered model
+    keep_indices = set()
+    for mid, idxs in model_map.items():
+        if mid in upstream_models:
+            keep_indices.update(idxs)
+
+    if not keep_indices:
+        return [], {}
+
+    # Build new list with re-indexed mapping
+    old_to_new = {}
+    new_upstreams = []
+    for old_idx in sorted(keep_indices):
+        old_to_new[old_idx] = len(new_upstreams)
+        new_upstreams.append(healthy[old_idx])
+
+    new_model_map = {}
+    for mid, idxs in model_map.items():
+        if mid in upstream_models:
+            new_idxs = [old_to_new[i] for i in idxs if i in old_to_new]
+            if new_idxs:
+                new_model_map[mid] = new_idxs
+
+    return new_upstreams, new_model_map
+
+
+def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None,
+               upstream_models: Optional[Set[str]] = None) -> FastAPI:
     router = LeastBusyRouter(upstreams, model_map=model_map)
     app = FastAPI()
 
@@ -196,16 +369,26 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
         async with httpx.AsyncClient(timeout=60.0) as client:
             for _ in range(num_candidates):
                 try:
-                    idx = router.acquire_backend(exclude=tried, model=model)
+                    handle, backend = router.acquire_backend(exclude=tried, model=model)
                 except RuntimeError:
                     break
-                backend = router.upstreams[idx]
+                _, idx = handle
                 tried.add(idx)
                 try:
                     upstream_url = f"{backend}/chat/completions"
+                    t0 = time.monotonic()
                     response = await client.post(
                         upstream_url, json=payload, headers=headers
                     )
+                    elapsed = time.monotonic() - t0
+                    # Extract token count for per-token latency
+                    tokens = 0
+                    try:
+                        usage = response.json().get("usage", {})
+                        tokens = usage.get("total_tokens", 0)
+                    except Exception:
+                        pass
+                    router.report_latency(handle, elapsed, tokens=tokens)
                     media_type = response.headers.get("content-type")
                     return Response(
                         content=response.content,
@@ -215,7 +398,7 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 except httpx.RequestError as exc:
                     last_error = str(exc)
                 finally:
-                    router.release_backend(idx)
+                    router.release_backend(handle)
 
         error_body = {"error": last_error or "All upstreams failed."}
         return Response(
@@ -245,6 +428,13 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
             )
 
         # Fallback: proxy to a backend
+        if not router.upstreams:
+            return Response(
+                content=json.dumps({"object": "list", "data": []}),
+                status_code=200,
+                media_type="application/json",
+            )
+
         headers = {
             key: value
             for key, value in request.headers.items()
@@ -256,12 +446,15 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             for _ in range(len(router.upstreams)):
-                idx = router.acquire_backend(exclude=tried)
-                backend = router.upstreams[idx]
+                handle, backend = router.acquire_backend(exclude=tried)
+                _, idx = handle
                 tried.add(idx)
                 try:
                     upstream_url = f"{backend}/models"
+                    t0 = time.monotonic()
                     response = await client.get(upstream_url, headers=headers)
+                    elapsed = time.monotonic() - t0
+                    router.report_latency(handle, elapsed)
                     media_type = response.headers.get("content-type")
                     return Response(
                         content=response.content,
@@ -271,12 +464,98 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 except httpx.RequestError as exc:
                     last_error = str(exc)
                 finally:
-                    router.release_backend(idx)
+                    router.release_backend(handle)
 
         error_body = {"error": last_error or "All upstreams failed."}
         return Response(
             content=json.dumps(error_body),
             status_code=502,
+            media_type="application/json",
+        )
+
+    @app.post("/admin/reload")
+    async def admin_reload(request: Request):
+        """Hot-reload backends. Accepts {"upstreams": ["http://host:port/v1", ...]}."""
+        try:
+            payload = await request.json()
+        except Exception:
+            return Response(
+                content=json.dumps({"error": "Invalid JSON body."}),
+                status_code=400,
+                media_type="application/json",
+            )
+
+        raw_upstreams = payload.get("upstreams", [])
+        if not raw_upstreams:
+            return Response(
+                content=json.dumps({"error": "Missing 'upstreams' list."}),
+                status_code=400,
+                media_type="application/json",
+            )
+
+        # Normalize URLs
+        normalized = [_normalize_base_url(u) for u in raw_upstreams]
+
+        # Probe and discover models
+        healthy, model_map = _probe_upstreams(normalized)
+
+        if not healthy:
+            return Response(
+                content=json.dumps({
+                    "error": "No healthy upstreams found.",
+                    "probed": normalized,
+                }),
+                status_code=502,
+                media_type="application/json",
+            )
+
+        # Filter to covered models only
+        healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
+
+        if not healthy:
+            return Response(
+                content=json.dumps({
+                    "error": "No backends match covered models.",
+                    "upstream_models": sorted(upstream_models) if upstream_models else "all",
+                }),
+                status_code=200,
+                media_type="application/json",
+            )
+
+        router.reload(healthy, model_map)
+
+        result = {
+            "status": "reloaded",
+            "upstreams": healthy,
+            "models": {
+                mid: [healthy[i] for i in idxs]
+                for mid, idxs in model_map.items()
+            },
+        }
+        print(f"[router] Admin reload: {len(healthy)} backends, "
+              f"models={sorted(model_map.keys())}")
+        return Response(
+            content=json.dumps(result),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    @app.get("/admin/status")
+    async def admin_status():
+        """Return current router state."""
+        return Response(
+            content=json.dumps({
+                "upstreams": list(router.upstreams),
+                "models": router.all_models,
+                "model_map": {
+                    mid: [router.upstreams[i] for i in idxs]
+                    for mid, idxs in router.model_map.items()
+                } if router.model_map else {},
+                "upstream_models": sorted(upstream_models) if upstream_models else "all",
+                "in_flight": list(router._in_flight),
+                "ema_latency": list(router._ema_latency),
+            }),
+            status_code=200,
             media_type="application/json",
         )
 
@@ -300,6 +579,11 @@ def main():
         "--upstreams",
         default=os.getenv("LLM_ROUTER_UPSTREAMS") or os.getenv("LOCAL_LLM_BASE_URL"),
         help="Comma-separated base URLs or a port range like http://worker-0:30000-30007",
+    )
+    parser.add_argument(
+        "--upstream-models",
+        default=None,
+        help='Comma-separated model names to cover, or "all" (default: all)',
     )
     parser.add_argument(
         "--test",
@@ -350,15 +634,41 @@ def main():
         asyncio.run(_run_tests())
         return
 
-    upstreams = _parse_upstreams(args.upstreams)
-    healthy, model_map = _probe_upstreams(upstreams)
-    if not healthy:
-        raise RuntimeError("No healthy upstreams available; aborting router startup.")
-    if len(healthy) < len(upstreams):
-        print("[router] Some upstreams are unhealthy and will be skipped.")
-    if model_map:
-        print(f"[router] Discovered {len(model_map)} model(s) across {len(healthy)} backend(s)")
-    app = create_app(healthy, model_map=model_map)
+    # Parse --upstream-models
+    upstream_models = None
+    if args.upstream_models and args.upstream_models.lower() != "all":
+        upstream_models = {m.strip() for m in args.upstream_models.split(",") if m.strip()}
+        print(f"[router] Upstream models: {sorted(upstream_models)}")
+    else:
+        print("[router] All upstream models")
+
+    if args.upstreams:
+        upstreams = _parse_upstreams(args.upstreams)
+        healthy, model_map = _probe_upstreams(upstreams)
+        if not healthy:
+            print("[router] Warning: no healthy upstreams found; starting with 0 backends.")
+            print("[router] Use POST /admin/reload to add backends later.")
+        else:
+            if len(healthy) < len(upstreams):
+                print("[router] Some upstreams are unhealthy and will be skipped.")
+            if model_map:
+                print(f"[router] Discovered {len(model_map)} model(s) across {len(healthy)} backend(s)")
+            healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
+    else:
+        # Auto-discover from squeue
+        healthy, model_map = _discover_from_squeue()
+        if healthy:
+            print(f"[router] Auto-discovered {len(healthy)} backend(s) from squeue")
+            healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
+            if healthy:
+                print(f"[router] After filtering: {len(healthy)} backend(s), "
+                      f"models={sorted(model_map.keys())}")
+            else:
+                print("[router] No backends match covered models after filtering.")
+        else:
+            print("[router] No backends discovered from squeue. "
+                  "Use POST /admin/reload to add backends later.")
+    app = create_app(healthy, model_map=model_map, upstream_models=upstream_models)
 
     uvicorn.run(app, host=args.listen, port=args.port)
 
