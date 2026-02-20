@@ -28,9 +28,9 @@ import json, sys
 temperature = float(sys.argv[1])
 prompts = sys.argv[2:]
 payload = {
-    "model": "default",
+    "model": "minimax-m2.5",
     "prompt": prompts,
-    "max_tokens": 8192,
+    "max_tokens": 2048,
     "temperature": temperature,
 }
 print(json.dumps(payload))
@@ -41,4 +41,4 @@ curl -sS -X POST \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer EMPTY" \
   -d "$payload" \
-  "$url"
+  "${url%/}/v1/completions"

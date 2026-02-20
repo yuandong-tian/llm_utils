@@ -15,7 +15,6 @@ import json
 import os
 import re
 import threading
-import time
 from typing import Dict, List, Optional, Set
 
 import httpx
@@ -68,26 +67,20 @@ class _RouterSnapshot:
     In-flight requests hold a reference to their snapshot so hot-reloads
     don't corrupt them.
     """
-    __slots__ = ("upstreams", "in_flight", "model_map", "ema_latency", "last_update")
+    __slots__ = ("upstreams", "in_flight", "model_map")
 
     def __init__(self, upstreams: List[str], model_map: Dict[str, List[int]]):
         self.upstreams = upstreams
         self.in_flight = [0] * len(upstreams)
         self.model_map = model_map
-        self.ema_latency = [0.0] * len(upstreams)
-        self.last_update = [0.0] * len(upstreams)  # monotonic timestamps
 
 
 class LeastBusyRouter:
     """Thread-safe router with model-aware routing and safe hot-reload.
 
-    Uses a snapshot pattern: each acquire() captures the current state so
-    that a reload() during an in-flight request cannot cause index errors
-    or route to the wrong backend.
+    Routes to the backend with the fewest in-flight requests.
+    Uses a snapshot pattern so hot-reloads don't corrupt in-flight requests.
     """
-
-    _ema_alpha = 0.3
-    _decay_half_life = 60.0  # seconds: EMA decays halfway to mean after this long idle
 
     def __init__(self, upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None):
         self._lock = threading.Lock()
@@ -95,10 +88,7 @@ class LeastBusyRouter:
 
     def acquire_backend(self, exclude: Optional[set] = None,
                         model: Optional[str] = None) -> tuple:
-        """Acquire the least-busy backend. Returns (handle, backend_url).
-
-        The handle must be passed to release_backend() when done.
-        """
+        """Acquire the least-busy backend. Returns (handle, backend_url)."""
         with self._lock:
             snap = self._snap
             allowed = None
@@ -116,28 +106,7 @@ class LeastBusyRouter:
             if not candidates:
                 raise RuntimeError(f"No available upstreams for model '{model}'.")
 
-            # Decay EMAs toward the mean for idle backends
-            now = time.monotonic()
-            active = [(idx, snap.ema_latency[idx]) for idx, _ in candidates
-                      if snap.ema_latency[idx] > 0]
-            if active:
-                mean_lat = sum(v for _, v in active) / len(active)
-                hl = self._decay_half_life
-                decayed = {}
-                for idx, _ in candidates:
-                    ema = snap.ema_latency[idx]
-                    if ema > 0 and snap.last_update[idx] > 0:
-                        age = now - snap.last_update[idx]
-                        factor = 0.5 ** (age / hl)
-                        decayed[idx] = mean_lat + (ema - mean_lat) * factor
-                    else:
-                        decayed[idx] = 0.0
-                # score = (in_flight + 1) * (latency + 0.001)
-                # +0.001 floor: latency is a tiebreaker, not a starve signal
-                idx, _ = min(candidates,
-                             key=lambda item: (item[1] + 1) * (decayed[item[0]] + 0.001))
-            else:
-                idx, _ = min(candidates, key=lambda item: item[1])
+            idx, _ = min(candidates, key=lambda item: item[1])
             snap.in_flight[idx] += 1
             return (snap, idx), snap.upstreams[idx]
 
@@ -148,43 +117,11 @@ class LeastBusyRouter:
             if idx < len(snap.in_flight):
                 snap.in_flight[idx] = max(0, snap.in_flight[idx] - 1)
 
-    def report_latency(self, handle, seconds: float, tokens: int = 0) -> None:
-        """Update EMA per-token latency for a backend after a successful request.
-
-        Args:
-            handle: The handle from acquire_backend().
-            seconds: Wall-clock time for the request.
-            tokens: Total tokens from the response usage field. If 0,
-                    the raw seconds are used (e.g. for /models requests).
-        """
-        snap, idx = handle
-        sample = seconds / max(tokens, 1) if tokens > 0 else seconds
-        alpha = self._ema_alpha
-        with self._lock:
-            if idx < len(snap.ema_latency):
-                old = snap.ema_latency[idx]
-                if old == 0.0:
-                    snap.ema_latency[idx] = sample
-                else:
-                    snap.ema_latency[idx] = alpha * sample + (1 - alpha) * old
-                snap.last_update[idx] = time.monotonic()
-
     def reload(self, new_upstreams: List[str],
                new_model_map: Optional[Dict[str, List[int]]] = None) -> None:
         """Hot-reload backends. In-flight requests on old snapshots are unaffected."""
         with self._lock:
-            old_snap = self._snap
-            new_snap = _RouterSnapshot(new_upstreams, new_model_map or {})
-            # Carry over EMA values for backends that persist
-            old_url_to_data = {
-                url: (old_snap.ema_latency[i], old_snap.last_update[i])
-                for i, url in enumerate(old_snap.upstreams)
-            }
-            for i, url in enumerate(new_snap.upstreams):
-                if url in old_url_to_data:
-                    new_snap.ema_latency[i] = old_url_to_data[url][0]
-                    new_snap.last_update[i] = old_url_to_data[url][1]
-            self._snap = new_snap
+            self._snap = _RouterSnapshot(new_upstreams, new_model_map or {})
 
     def backends_for_model(self, model: str) -> List[int]:
         """Return upstream indices that serve a given model."""
@@ -207,13 +144,7 @@ class LeastBusyRouter:
 
     @property
     def _in_flight(self):
-        """Expose in_flight for /admin/status."""
         return self._snap.in_flight
-
-    @property
-    def _ema_latency(self):
-        """Expose ema_latency for /admin/status."""
-        return self._snap.ema_latency
 
 
 def _probe_upstreams(upstreams: List[str]):
@@ -348,8 +279,8 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
         async def _start_discover():
             asyncio.create_task(_auto_discover_loop())
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request):
+    async def _proxy_post(request: Request, endpoint: str):
+        """Proxy a POST request to an upstream backend."""
         payload = await request.json()
         model = payload.get("model")
         headers = {
@@ -358,16 +289,12 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
             if key.lower() not in {"host", "content-length"}
         }
 
-        # Check if model is known
         if model and router.model_map and model not in router.model_map:
-            error_body = {
-                "error": {
+            return Response(
+                content=json.dumps({"error": {
                     "message": f"Model '{model}' not found. Available: {router.all_models}",
                     "type": "invalid_request_error",
-                }
-            }
-            return Response(
-                content=json.dumps(error_body),
+                }}),
                 status_code=404,
                 media_type="application/json",
             )
@@ -385,37 +312,32 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 _, idx = handle
                 tried.add(idx)
                 try:
-                    upstream_url = f"{backend}/chat/completions"
-                    t0 = time.monotonic()
                     response = await client.post(
-                        upstream_url, json=payload, headers=headers
+                        f"{backend}/{endpoint}", json=payload, headers=headers
                     )
-                    elapsed = time.monotonic() - t0
-                    # Extract token count for per-token latency
-                    tokens = 0
-                    try:
-                        usage = response.json().get("usage", {})
-                        tokens = usage.get("total_tokens", 0)
-                    except Exception:
-                        pass
-                    router.report_latency(handle, elapsed, tokens=tokens)
-                    media_type = response.headers.get("content-type")
                     return Response(
                         content=response.content,
                         status_code=response.status_code,
-                        media_type=media_type,
+                        media_type=response.headers.get("content-type"),
                     )
                 except httpx.RequestError as exc:
                     last_error = str(exc)
                 finally:
                     router.release_backend(handle)
 
-        error_body = {"error": last_error or "All upstreams failed."}
         return Response(
-            content=json.dumps(error_body),
+            content=json.dumps({"error": last_error or "All upstreams failed."}),
             status_code=502,
             media_type="application/json",
         )
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        return await _proxy_post(request, "chat/completions")
+
+    @app.post("/v1/completions")
+    async def completions(request: Request):
+        return await _proxy_post(request, "completions")
 
     @app.get("/v1/models")
     async def list_models(request: Request):
@@ -460,16 +382,11 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 _, idx = handle
                 tried.add(idx)
                 try:
-                    upstream_url = f"{backend}/models"
-                    t0 = time.monotonic()
-                    response = await client.get(upstream_url, headers=headers)
-                    elapsed = time.monotonic() - t0
-                    router.report_latency(handle, elapsed)
-                    media_type = response.headers.get("content-type")
+                    response = await client.get(f"{backend}/models", headers=headers)
                     return Response(
                         content=response.content,
                         status_code=response.status_code,
-                        media_type=media_type,
+                        media_type=response.headers.get("content-type"),
                     )
                 except httpx.RequestError as exc:
                     last_error = str(exc)
@@ -563,7 +480,6 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 } if router.model_map else {},
                 "upstream_models": sorted(upstream_models) if upstream_models else "all",
                 "in_flight": list(router._in_flight),
-                "ema_latency": list(router._ema_latency),
             }),
             status_code=200,
             media_type="application/json",
