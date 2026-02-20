@@ -22,6 +22,8 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
 
+from job_utils import get_jobs, parse_log_info
+
 
 def _expand_api_base_range(api_base: str) -> List[str]:
     match = re.match(r"^(https?://[^:/]+:\d+)-(\d+)$", api_base.strip())
@@ -254,30 +256,17 @@ def _probe_upstreams(upstreams: List[str]):
 def _discover_from_squeue(log_dir: Optional[str] = None) -> tuple:
     """Auto-discover upstream URLs from running squeue jobs.
 
-    Uses parse_log_info to only include backends that are Ready/Serving.
-    Returns (healthy, model_map) or ([], {}) if unavailable.
+    Returns (healthy_upstreams, model_map) or ([], {}) if none found.
     """
-    try:
-        from job_utils import get_jobs, parse_log_info
-    except ImportError:
-        print("[router] job_utils not found, cannot auto-discover from squeue")
-        return [], {}
-
-    jobs = get_jobs()
     urls = []
-    for job in jobs:
+    for job in get_jobs():
         if job.get("state") != "RUNNING":
             continue
         info = parse_log_info(job, log_dir=log_dir)
-        status = info.get("status", "")
         port = info.get("port", "?")
-        if port != "?" and status in ("Ready", "Serving"):
+        if port != "?" and info.get("status") in ("Ready", "Serving"):
             urls.append(f"http://{job['node']}:{port}/v1")
-
-    if not urls:
-        return [], {}
-
-    return _probe_upstreams(urls)
+    return _probe_upstreams(urls) if urls else ([], {})
 
 
 def _filter_by_models(
@@ -676,31 +665,17 @@ def main():
         print("[router] All upstream models")
 
     if args.upstreams:
-        upstreams = _parse_upstreams(args.upstreams)
-        healthy, model_map = _probe_upstreams(upstreams)
-        if not healthy:
-            print("[router] Warning: no healthy upstreams found; starting with 0 backends.")
-            print("[router] Use POST /admin/reload to add backends later.")
-        else:
-            if len(healthy) < len(upstreams):
-                print("[router] Some upstreams are unhealthy and will be skipped.")
-            if model_map:
-                print(f"[router] Discovered {len(model_map)} model(s) across {len(healthy)} backend(s)")
-            healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
+        healthy, model_map = _probe_upstreams(_parse_upstreams(args.upstreams))
     else:
-        # Auto-discover from squeue
         healthy, model_map = _discover_from_squeue(log_dir=args.log_dir)
-        if healthy:
-            print(f"[router] Auto-discovered {len(healthy)} backend(s) from squeue")
-            healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
-            if healthy:
-                print(f"[router] After filtering: {len(healthy)} backend(s), "
-                      f"models={sorted(model_map.keys())}")
-            else:
-                print("[router] No backends match covered models after filtering.")
-        else:
-            print("[router] No backends discovered from squeue. "
-                  "Use POST /admin/reload to add backends later.")
+
+    if healthy:
+        healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
+
+    if healthy:
+        print(f"[router] {len(healthy)} backend(s), models={sorted(model_map.keys())}")
+    else:
+        print("[router] No backends found; use POST /admin/reload to add later.")
     if args.discover_interval > 0:
         print(f"[router] Auto-discover from squeue every {args.discover_interval}s")
 
