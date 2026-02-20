@@ -251,29 +251,16 @@ def _probe_upstreams(upstreams: List[str]):
     return healthy, model_map
 
 
-def _import_cluster_utils():
-    """Try to import cluster_utils from known locations."""
-    import sys
-    for path in [
-        os.path.expanduser("~/test_cluster/yuandong"),
-        os.path.dirname(os.path.abspath(__file__)),
-    ]:
-        if path not in sys.path:
-            sys.path.insert(0, path)
-    from cluster_utils import get_jobs, parse_log_info
-    return get_jobs, parse_log_info
-
-
-def _discover_from_squeue() -> tuple:
+def _discover_from_squeue(log_dir: Optional[str] = None) -> tuple:
     """Auto-discover upstream URLs from running squeue jobs.
 
     Uses parse_log_info to only include backends that are Ready/Serving.
     Returns (healthy, model_map) or ([], {}) if unavailable.
     """
     try:
-        get_jobs, parse_log_info = _import_cluster_utils()
+        from job_utils import get_jobs, parse_log_info
     except ImportError:
-        print("[router] cluster_utils not found, cannot auto-discover from squeue")
+        print("[router] job_utils not found, cannot auto-discover from squeue")
         return [], {}
 
     jobs = get_jobs()
@@ -281,7 +268,7 @@ def _discover_from_squeue() -> tuple:
     for job in jobs:
         if job.get("state") != "RUNNING":
             continue
-        info = parse_log_info(job)
+        info = parse_log_info(job, log_dir=log_dir)
         status = info.get("status", "")
         port = info.get("port", "?")
         if port != "?" and status in ("Ready", "Serving"):
@@ -333,7 +320,8 @@ def _filter_by_models(
 
 def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None,
                upstream_models: Optional[Set[str]] = None,
-               discover_interval: int = 0) -> FastAPI:
+               discover_interval: int = 0,
+               log_dir: Optional[str] = None) -> FastAPI:
     router = LeastBusyRouter(upstreams, model_map=model_map)
     app = FastAPI()
 
@@ -350,7 +338,7 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 await asyncio.sleep(discover_interval)
                 try:
                     healthy, mmap = await asyncio.get_event_loop().run_in_executor(
-                        None, _discover_from_squeue
+                        None, lambda: _discover_from_squeue(log_dir=log_dir)
                     )
                     if not healthy:
                         continue
@@ -626,6 +614,11 @@ def main():
         help="Auto-discover backends from squeue every N seconds (0 = disabled, default: 30)",
     )
     parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory containing job .err logs (default: env LLM_LOG_DIR or ~/test_cluster/yuandong)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Send a quick test request to the running router and exit",
@@ -696,7 +689,7 @@ def main():
             healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
     else:
         # Auto-discover from squeue
-        healthy, model_map = _discover_from_squeue()
+        healthy, model_map = _discover_from_squeue(log_dir=args.log_dir)
         if healthy:
             print(f"[router] Auto-discovered {len(healthy)} backend(s) from squeue")
             healthy, model_map = _filter_by_models(healthy, model_map, upstream_models)
@@ -712,7 +705,7 @@ def main():
         print(f"[router] Auto-discover from squeue every {args.discover_interval}s")
 
     app = create_app(healthy, model_map=model_map, upstream_models=upstream_models,
-                     discover_interval=args.discover_interval)
+                     discover_interval=args.discover_interval, log_dir=args.log_dir)
 
     uvicorn.run(app, host=args.listen, port=args.port)
 
