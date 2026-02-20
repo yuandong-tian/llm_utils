@@ -251,25 +251,27 @@ def _probe_upstreams(upstreams: List[str]):
     return healthy, model_map
 
 
+def _import_cluster_utils():
+    """Try to import cluster_utils from known locations."""
+    import sys
+    for path in [
+        os.path.expanduser("~/test_cluster/yuandong"),
+        os.path.dirname(os.path.abspath(__file__)),
+    ]:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    from cluster_utils import get_jobs, parse_log_info
+    return get_jobs, parse_log_info
+
+
 def _discover_from_squeue() -> tuple:
     """Auto-discover upstream URLs from running squeue jobs.
 
-    Tries to import cluster_utils for get_jobs/get_port_from_log.
+    Uses parse_log_info to only include backends that are Ready/Serving.
     Returns (healthy, model_map) or ([], {}) if unavailable.
     """
     try:
-        import subprocess
-        # Try to find cluster_utils
-        import importlib
-        import sys
-        # Search common locations
-        for path in [
-            os.path.expanduser("~/test_cluster/yuandong"),
-            os.path.dirname(os.path.abspath(__file__)),
-        ]:
-            if path not in sys.path:
-                sys.path.insert(0, path)
-        from cluster_utils import get_jobs, get_port_from_log
+        get_jobs, parse_log_info = _import_cluster_utils()
     except ImportError:
         print("[router] cluster_utils not found, cannot auto-discover from squeue")
         return [], {}
@@ -279,8 +281,10 @@ def _discover_from_squeue() -> tuple:
     for job in jobs:
         if job.get("state") != "RUNNING":
             continue
-        port = get_port_from_log(job["job_id"])
-        if port:
+        info = parse_log_info(job)
+        status = info.get("status", "")
+        port = info.get("port", "?")
+        if port != "?" and status in ("Ready", "Serving"):
             urls.append(f"http://{job['node']}:{port}/v1")
 
     if not urls:
@@ -328,7 +332,8 @@ def _filter_by_models(
 
 
 def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] = None,
-               upstream_models: Optional[Set[str]] = None) -> FastAPI:
+               upstream_models: Optional[Set[str]] = None,
+               discover_interval: int = 0) -> FastAPI:
     router = LeastBusyRouter(upstreams, model_map=model_map)
     app = FastAPI()
 
@@ -337,6 +342,34 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
         for model, indices in sorted(model_map.items()):
             backends = [upstreams[i] for i in indices]
             print(f"  {model} -> {backends}")
+
+    if discover_interval > 0:
+        async def _auto_discover_loop():
+            """Periodically discover backends from squeue and reload."""
+            while True:
+                await asyncio.sleep(discover_interval)
+                try:
+                    healthy, mmap = await asyncio.get_event_loop().run_in_executor(
+                        None, _discover_from_squeue
+                    )
+                    if not healthy:
+                        continue
+                    healthy, mmap = _filter_by_models(healthy, mmap, upstream_models)
+                    if not healthy:
+                        continue
+                    # Only reload if the set of backends changed
+                    current = set(router.upstreams)
+                    new_set = set(healthy)
+                    if current != new_set:
+                        router.reload(healthy, mmap)
+                        print(f"[router] Auto-discover: {len(healthy)} backend(s), "
+                              f"models={sorted(mmap.keys())}")
+                except Exception as exc:
+                    print(f"[router] Auto-discover error: {exc}")
+
+        @app.on_event("startup")
+        async def _start_discover():
+            asyncio.create_task(_auto_discover_loop())
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -586,6 +619,13 @@ def main():
         help='Comma-separated model names to cover, or "all" (default: all)',
     )
     parser.add_argument(
+        "--discover-interval",
+        type=int,
+        default=30,
+        metavar="SECONDS",
+        help="Auto-discover backends from squeue every N seconds (0 = disabled, default: 30)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Send a quick test request to the running router and exit",
@@ -668,7 +708,11 @@ def main():
         else:
             print("[router] No backends discovered from squeue. "
                   "Use POST /admin/reload to add backends later.")
-    app = create_app(healthy, model_map=model_map, upstream_models=upstream_models)
+    if args.discover_interval > 0:
+        print(f"[router] Auto-discover from squeue every {args.discover_interval}s")
+
+    app = create_app(healthy, model_map=model_map, upstream_models=upstream_models,
+                     discover_interval=args.discover_interval)
 
     uvicorn.run(app, host=args.listen, port=args.port)
 
