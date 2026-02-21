@@ -243,6 +243,11 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                discover_interval: int = 0,
                log_dir: Optional[str] = None) -> FastAPI:
     router = LeastBusyRouter(upstreams, model_map=model_map)
+    # Shared client: short connect timeout (5s), long read timeout (5min) for generations.
+    # Connection pool limits prevent overloading backends.
+    timeout = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=10.0)
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    proxy_client = httpx.AsyncClient(timeout=timeout, limits=limits)
     app = FastAPI()
 
     if model_map:
@@ -250,6 +255,10 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
         for model, indices in sorted(model_map.items()):
             backends = [upstreams[i] for i in indices]
             print(f"  {model} -> {backends}")
+
+    @app.on_event("shutdown")
+    async def _shutdown():
+        await proxy_client.aclose()
 
     if discover_interval > 0:
         async def _auto_discover_loop():
@@ -303,28 +312,33 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
         tried = set()
         num_candidates = len(router.backends_for_model(model)) if model else len(router.upstreams)
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            for _ in range(num_candidates):
-                try:
-                    handle, backend = router.acquire_backend(exclude=tried, model=model)
-                except RuntimeError:
-                    break
-                _, idx = handle
-                tried.add(idx)
-                try:
-                    response = await client.post(
-                        f"{backend}/{endpoint}", json=payload, headers=headers
-                    )
-                    return Response(
-                        content=response.content,
-                        status_code=response.status_code,
-                        media_type=response.headers.get("content-type"),
-                    )
-                except httpx.RequestError as exc:
-                    last_error = str(exc)
-                finally:
-                    router.release_backend(handle)
+        for _ in range(num_candidates):
+            try:
+                handle, backend = router.acquire_backend(exclude=tried, model=model)
+            except RuntimeError:
+                break
+            _, idx = handle
+            tried.add(idx)
+            try:
+                response = await proxy_client.post(
+                    f"{backend}/{endpoint}", json=payload, headers=headers
+                )
+                if response.status_code >= 500:
+                    last_error = f"{backend} returned {response.status_code}"
+                    print(f"[router] {last_error}")
+                    continue
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type"),
+                )
+            except httpx.RequestError as exc:
+                last_error = f"{backend}: {type(exc).__name__}: {exc}"
+                print(f"[router] {last_error}")
+            finally:
+                router.release_backend(handle)
 
+        print(f"[router] All {len(tried)} backend(s) failed for {endpoint} model={model}")
         return Response(
             content=json.dumps({"error": last_error or "All upstreams failed."}),
             status_code=502,
@@ -376,22 +390,21 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
         last_error = None
         tried = set()
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for _ in range(len(router.upstreams)):
-                handle, backend = router.acquire_backend(exclude=tried)
-                _, idx = handle
-                tried.add(idx)
-                try:
-                    response = await client.get(f"{backend}/models", headers=headers)
-                    return Response(
-                        content=response.content,
-                        status_code=response.status_code,
-                        media_type=response.headers.get("content-type"),
-                    )
-                except httpx.RequestError as exc:
-                    last_error = str(exc)
-                finally:
-                    router.release_backend(handle)
+        for _ in range(len(router.upstreams)):
+            handle, backend = router.acquire_backend(exclude=tried)
+            _, idx = handle
+            tried.add(idx)
+            try:
+                response = await proxy_client.get(f"{backend}/models", headers=headers)
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type"),
+                )
+            except httpx.RequestError as exc:
+                last_error = str(exc)
+            finally:
+                router.release_backend(handle)
 
         error_body = {"error": last_error or "All upstreams failed."}
         return Response(
