@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Set
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from starlette.responses import StreamingResponse
 
 from job_utils import get_jobs, parse_log_info
 
@@ -244,10 +245,11 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                log_dir: Optional[str] = None) -> FastAPI:
     router = LeastBusyRouter(upstreams, model_map=model_map)
     # Shared client: short connect timeout (5s), long read timeout (5min) for generations.
-    # Connection pool limits prevent overloading backends.
-    timeout = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=10.0)
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    proxy_client = httpx.AsyncClient(timeout=timeout, limits=limits)
+    # Large pool to handle many concurrent streaming requests without blocking.
+    timeout = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=30.0)
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    _client = [httpx.AsyncClient(timeout=timeout, limits=limits)]
+    _CLIENT_RECYCLE_SECS = 1800  # recreate client every 30 min to avoid stale connections
     app = FastAPI()
 
     if model_map:
@@ -258,7 +260,25 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
 
     @app.on_event("shutdown")
     async def _shutdown():
-        await proxy_client.aclose()
+        await _client[0].aclose()
+
+    async def _recycle_client_loop():
+        """Recreate HTTP client periodically to prevent connection pool staleness."""
+        while True:
+            await asyncio.sleep(_CLIENT_RECYCLE_SECS)
+            try:
+                old = _client[0]
+                _client[0] = httpx.AsyncClient(timeout=timeout, limits=limits)
+                # Grace period for in-flight requests on old client
+                await asyncio.sleep(120)
+                await old.aclose()
+                print("[router] Recycled HTTP connection pool")
+            except Exception as exc:
+                print(f"[router] Client recycle error: {exc}")
+
+    @app.on_event("startup")
+    async def _start_recycle():
+        asyncio.create_task(_recycle_client_loop())
 
     if discover_interval > 0:
         async def _auto_discover_loop():
@@ -289,9 +309,15 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
             asyncio.create_task(_auto_discover_loop())
 
     async def _proxy_post(request: Request, endpoint: str):
-        """Proxy a POST request to an upstream backend."""
+        """Proxy a POST request to an upstream backend.
+
+        Streaming requests (stream=true) use httpx streaming so SSE events
+        are forwarded immediately instead of buffered, preventing connection
+        pool exhaustion under sustained load.
+        """
         payload = await request.json()
         model = payload.get("model")
+        is_stream = payload.get("stream", False)
         headers = {
             key: value
             for key, value in request.headers.items()
@@ -319,24 +345,67 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
                 break
             _, idx = handle
             tried.add(idx)
-            try:
-                response = await proxy_client.post(
-                    f"{backend}/{endpoint}", json=payload, headers=headers
-                )
-                if response.status_code >= 500:
-                    last_error = f"{backend} returned {response.status_code}"
+
+            if is_stream:
+                # Streaming path: open the upstream connection, check status,
+                # then hand off to StreamingResponse which releases the handle
+                # when the stream finishes (or client disconnects).
+                try:
+                    req = _client[0].build_request(
+                        "POST", f"{backend}/{endpoint}",
+                        json=payload, headers=headers,
+                    )
+                    upstream_resp = await _client[0].send(req, stream=True)
+                except httpx.RequestError as exc:
+                    router.release_backend(handle)
+                    last_error = f"{backend}: {type(exc).__name__}: {exc}"
                     print(f"[router] {last_error}")
                     continue
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    media_type=response.headers.get("content-type"),
+
+                if upstream_resp.status_code >= 500:
+                    await upstream_resp.aclose()
+                    router.release_backend(handle)
+                    last_error = f"{backend} returned {upstream_resp.status_code}"
+                    print(f"[router] {last_error}")
+                    continue
+
+                # Success — stream response through. The generator's finally
+                # block ensures cleanup even if the client disconnects early.
+                async def _stream_body(resp=upstream_resp, h=handle):
+                    try:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                    finally:
+                        await resp.aclose()
+                        router.release_backend(h)
+
+                return StreamingResponse(
+                    _stream_body(),
+                    status_code=upstream_resp.status_code,
+                    media_type=upstream_resp.headers.get(
+                        "content-type", "text/event-stream"
+                    ),
                 )
-            except httpx.RequestError as exc:
-                last_error = f"{backend}: {type(exc).__name__}: {exc}"
-                print(f"[router] {last_error}")
-            finally:
-                router.release_backend(handle)
+            else:
+                # Non-streaming path: read full response, release immediately.
+                try:
+                    response = await _client[0].post(
+                        f"{backend}/{endpoint}", json=payload, headers=headers
+                    )
+                    if response.status_code >= 500:
+                        last_error = f"{backend} returned {response.status_code}"
+                        print(f"[router] {last_error}")
+                        continue
+                    return Response(
+                        content=response.content,
+                        status_code=response.status_code,
+                        media_type=response.headers.get("content-type"),
+                    )
+                except httpx.RequestError as exc:
+                    last_error = f"{backend}: {type(exc).__name__}: {exc}"
+                    print(f"[router] {last_error}")
+                finally:
+                    router.release_backend(handle)
 
         print(f"[router] All {len(tried)} backend(s) failed for {endpoint} model={model}")
         return Response(
@@ -395,7 +464,7 @@ def create_app(upstreams: List[str], model_map: Optional[Dict[str, List[int]]] =
             _, idx = handle
             tried.add(idx)
             try:
-                response = await proxy_client.get(f"{backend}/models", headers=headers)
+                response = await _client[0].get(f"{backend}/models", headers=headers)
                 return Response(
                     content=response.content,
                     status_code=response.status_code,
