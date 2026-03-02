@@ -92,6 +92,71 @@ If you want to send a raw request, `run_query.sh` can be used:
 ./run_query.sh http://localhost:8001/v1/chat/completions "Hello router"
 ```
 
+## Web Outlet (Service Registry Portal)
+
+`web_outlet.py` runs a lightweight portal on a fixed port. Any uvicorn-based
+service can register itself at runtime, making it instantly visible and
+linkable from the portal page.
+
+### Start the outlet
+
+```bash
+python web_outlet.py --port PORT
+```
+
+Open `http://localhost:PORT` to see the portal. It polls for changes every 3s.
+
+### Register your service
+
+**Context manager (auto-deregisters on exit):**
+```python
+from web_outlet import OutletClient
+import uvicorn
+
+with OutletClient("http://localhost:PORT") as client:
+    client.register("My API", "http://localhost:8080",
+                    description="LLaMA server", tags=["ml", "llm"])
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+```
+
+**Manual register / deregister:**
+```python
+client = OutletClient("http://localhost:PORT")
+client.register("My API", "http://localhost:8080")
+uvicorn.run(app, host="0.0.0.0", port=8080)
+client.deregister()
+```
+
+**With TTL — entry auto-expires if the process dies:**
+```python
+client.register("Worker", "http://localhost:8080", ttl=30)
+# re-call register() every ~20s to refresh
+```
+
+**Async:**
+```python
+from web_outlet import AsyncOutletClient
+
+async with AsyncOutletClient("http://localhost:PORT") as client:
+    await client.register("My API", "http://localhost:8080")
+    ...
+```
+
+### Raw API
+
+```bash
+# Register
+curl -X POST http://localhost:PORT/api/register \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"my-svc","url":"http://localhost:8080","tags":["api"],"ttl":60}'
+
+# List
+curl http://localhost:PORT/api/services
+
+# Remove
+curl -X DELETE http://localhost:PORT/api/register/my-svc
+```
+
 ## Environment
 
 `llm_util.py` will read `../config/bashrc` for keys if they are not already in the environment.
