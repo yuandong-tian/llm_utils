@@ -94,9 +94,10 @@ If you want to send a raw request, `run_query.sh` can be used:
 
 ## Web Outlet (Service Registry Portal)
 
-`web_outlet.py` runs a lightweight portal on a fixed port. Any uvicorn-based
-service can register itself at runtime, making it instantly visible and
-linkable from the portal page.
+`web_outlet.py` runs a central portal on a fixed port. Services register
+themselves from the backend; the outlet proxies all traffic to them so their
+internal addresses are never exposed. The portal page only shows public proxy
+paths.
 
 ### Start the outlet
 
@@ -107,6 +108,10 @@ python web_outlet.py --port PORT
 Open `http://localhost:PORT` to see the portal. It polls for changes every 3s.
 
 ### Register your service
+
+Services register via the `OutletClient`, providing their **internal** URL.
+Once registered, they are reachable publicly through the outlet at
+`/proxy/{name}/` — no internal host or port is exposed.
 
 **Context manager (auto-deregisters on exit):**
 ```python
@@ -142,7 +147,18 @@ async with AsyncOutletClient("http://localhost:PORT") as client:
     ...
 ```
 
-### Raw API
+### Accessing a service
+
+Once registered, every service is reachable through the outlet:
+
+```
+http://outlet-host:PORT/proxy/{name}/
+```
+
+The outlet transparently relays all HTTP traffic — including streaming and
+SSE responses — to the service's internal URL.
+
+### Registration API (backend only)
 
 ```bash
 # Register
@@ -150,7 +166,7 @@ curl -X POST http://localhost:PORT/api/register \
   -H 'Content-Type: application/json' \
   -d '{"name":"my-svc","url":"http://localhost:8080","tags":["api"],"ttl":60}'
 
-# List
+# List (returns public metadata only — no internal URLs)
 curl http://localhost:PORT/api/services
 
 # Remove
