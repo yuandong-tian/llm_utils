@@ -1,8 +1,9 @@
-"""Web Outlet — Dynamic service registry portal.
+"""Web Outlet — Dynamic service registry portal with transparent proxying.
 
 Runs a central hub on a fixed port (default 3772). Any uvicorn-based service
-can register itself at runtime, making it instantly visible and linkable from
-the portal page.
+can register itself at runtime, making it instantly visible from the portal.
+All traffic to registered services is relayed through the outlet — the
+internal addresses are never exposed to the public.
 
 Usage — start the outlet:
     python web_outlet.py
@@ -31,6 +32,11 @@ Registration payload (POST /api/register):
 
     ttl: optional time-to-live in seconds. If set, the entry expires unless
          re-registered before then. Useful for ephemeral processes.
+
+Proxy:
+    Every registered service is reachable at /proxy/{name}/ through the outlet.
+    The outlet transparently relays all HTTP traffic (including streaming/SSE)
+    to the service's internal URL, which is never exposed to the public.
 """
 
 import argparse
@@ -41,9 +47,10 @@ from typing import List, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -58,7 +65,7 @@ class ServiceRegistration(BaseModel):
 
 class ServiceEntry(BaseModel):
     name: str
-    url: str
+    url: str           # internal — never sent to the browser
     description: str = ""
     tags: List[str] = []
     registered_at: float = 0.0
@@ -69,6 +76,12 @@ class ServiceEntry(BaseModel):
 
 _registry: dict[str, ServiceEntry] = {}
 
+# Headers that must not be forwarded through a proxy
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+})
+
 
 def _prune_expired() -> None:
     now = time.time()
@@ -77,6 +90,17 @@ def _prune_expired() -> None:
     ]
     for k in expired:
         del _registry[k]
+
+
+def _public_entry(s: ServiceEntry) -> dict:
+    """Return a service entry safe to expose publicly (no internal URL)."""
+    return {
+        "name": s.name,
+        "description": s.description,
+        "tags": s.tags,
+        "registered_at": s.registered_at,
+        "expires_at": s.expires_at,
+    }
 
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
@@ -108,7 +132,7 @@ async def portal():
 @app.get("/api/services")
 async def list_services():
     _prune_expired()
-    return JSONResponse([s.model_dump() for s in _registry.values()])
+    return JSONResponse([_public_entry(s) for s in _registry.values()])
 
 
 @app.post("/api/register", status_code=201)
@@ -131,6 +155,74 @@ async def deregister(name: str):
         raise HTTPException(404, f"Service '{name}' not found")
     del _registry[name]
     return {"status": "deregistered", "name": name}
+
+
+# ─── Reverse Proxy ────────────────────────────────────────────────────────────
+
+_PROXY_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+
+
+@app.api_route("/proxy/{name}", methods=_PROXY_METHODS)
+@app.api_route("/proxy/{name}/{path:path}", methods=_PROXY_METHODS)
+async def proxy(request: Request, name: str, path: str = ""):
+    _prune_expired()
+    if name not in _registry:
+        raise HTTPException(404, f"Service '{name}' is not registered")
+
+    svc = _registry[name]
+    target = svc.url.rstrip("/")
+    if path:
+        target += "/" + path
+    if request.url.query:
+        target += "?" + request.url.query
+
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
+    }
+
+    body = await request.body()
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10, read=120, write=60, pool=10),
+        follow_redirects=True,
+    )
+    try:
+        upstream_req = client.build_request(
+            method=request.method,
+            url=target,
+            headers=fwd_headers,
+            content=body,
+        )
+        resp = await client.send(upstream_req, stream=True)
+    except httpx.ConnectError:
+        await client.aclose()
+        raise HTTPException(502, f"Cannot reach '{name}' — is it running?")
+    except httpx.TimeoutException:
+        await client.aclose()
+        raise HTTPException(504, f"'{name}' timed out")
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(502, str(exc))
+
+    resp_headers = {
+        k: v for k, v in resp.headers.items()
+        if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"
+    }
+
+    async def stream_body():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_body(),
+        status_code=resp.status_code,
+        headers=resp_headers,
+    )
 
 
 # ─── Client (sync) ────────────────────────────────────────────────────────────
@@ -210,7 +302,6 @@ class AsyncOutletClient:
     def __init__(self, outlet_url: str = "http://localhost:3772"):
         self.outlet_url = outlet_url.rstrip("/")
         self._registered_name: Optional[str] = None
-        self._http: Optional[httpx.AsyncClient] = None
 
     async def register(
         self,
@@ -273,7 +364,6 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
       --amber-dim: #4a3208;
       --green:     #2ecc71;
       --green-lo:  #1a5c3a;
-      --green-dim: #0d3320;
       --red:       #e84040;
       --text:      #c8b896;
       --text-lo:   #605040;
@@ -306,14 +396,13 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
       background: radial-gradient(ellipse 120% 80% at 50% 50%, transparent 55%, rgba(0,0,0,0.7) 100%);
     }
 
-    /* ── Header ─────────────────────────────────────────────── */
+    /* ── Header ──────────────────────────────────────────────── */
     header {
       display: flex; align-items: center; gap: 2rem;
       padding: 1.5rem 2.5rem;
       border-bottom: 1px solid var(--border);
       background: linear-gradient(180deg, rgba(232,160,32,0.03) 0%, transparent 100%);
     }
-
     .logo {
       display: flex; align-items: baseline; gap: 0.6rem;
       font-size: 1.3rem; font-weight: 700; letter-spacing: 0.22em;
@@ -326,10 +415,7 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
 
     .header-right { margin-left: auto; display: flex; align-items: center; gap: 2rem; }
-
-    .stat-box {
-      text-align: right; line-height: 1.2;
-    }
+    .stat-box { text-align: right; line-height: 1.2; }
     .stat-val {
       font-size: 1.4rem; font-weight: 700; color: var(--green);
       text-shadow: 0 0 16px rgba(46,204,113,0.4);
@@ -356,7 +442,7 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
       100% { transform: scale(1.8); opacity: 0; }
     }
 
-    /* ── Layout ─────────────────────────────────────────────── */
+    /* ── Layout ──────────────────────────────────────────────── */
     .main { padding: 2rem 2.5rem 4rem; }
 
     .section-label {
@@ -370,7 +456,7 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
       background: linear-gradient(90deg, var(--border) 0%, transparent 100%);
     }
 
-    /* ── Service Grid ────────────────────────────────────────── */
+    /* ── Service Grid ─────────────────────────────────────────── */
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -386,6 +472,9 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
       position: relative;
       overflow: hidden;
       transition: background 0.2s;
+      text-decoration: none;
+      display: block;
+      color: inherit;
     }
     .card::after {
       content: '';
@@ -397,7 +486,6 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
     .card:hover { background: var(--bg3); }
     .card:hover::after { opacity: 1; }
 
-    /* top accent bar animates in on hover */
     .card-accent {
       position: absolute; top: 0; left: 0; right: 0; height: 2px;
       background: linear-gradient(90deg, var(--amber) 0%, transparent 100%);
@@ -413,37 +501,34 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
     }
     .card-status-dot {
       width: 5px; height: 5px; border-radius: 50%;
-      background: var(--green);
-      box-shadow: 0 0 6px var(--green);
+      background: var(--green); box-shadow: 0 0 6px var(--green);
       flex-shrink: 0;
     }
 
     .card-name {
       font-size: 0.95rem; font-weight: 700;
-      color: var(--amber);
-      letter-spacing: 0.05em; margin-bottom: 0.35rem;
+      color: var(--amber); letter-spacing: 0.05em; margin-bottom: 0.3rem;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
 
-    .card-url {
-      display: block; font-size: 0.72rem; color: var(--green);
-      text-decoration: none; margin-bottom: 0.8rem;
-      opacity: 0.75; transition: opacity 0.15s;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    /* proxy path badge — replaces exposed URL */
+    .card-proxy {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      font-size: 0.65rem; color: var(--text-lo);
+      margin-bottom: 0.85rem; letter-spacing: 0.05em;
     }
-    .card-url:hover { opacity: 1; text-decoration: underline; }
+    .card-proxy-arrow { color: var(--green-lo); }
 
     .card-desc {
       font-size: 0.75rem; line-height: 1.65;
-      color: var(--text); opacity: 0.65;
+      color: var(--text); opacity: 0.6;
       margin-bottom: 0.9rem;
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
       overflow: hidden;
     }
 
     .card-footer {
-      display: flex; align-items: flex-end; justify-content: space-between;
-      gap: 0.5rem;
+      display: flex; align-items: flex-end; justify-content: space-between; gap: 0.5rem;
     }
     .tags { display: flex; flex-wrap: wrap; gap: 0.3rem; }
     .tag {
@@ -453,118 +538,27 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
     }
     .card-time { font-size: 0.58rem; color: var(--text-dim); white-space: nowrap; }
 
-    /* expire bar */
-    .expire-bar-wrap {
-      height: 2px; background: var(--bg3);
-      margin-top: 0.75rem; overflow: hidden;
+    /* open arrow shown on hover */
+    .card-open {
+      position: absolute; top: 1.2rem; right: 1.2rem;
+      font-size: 0.8rem; color: var(--amber-lo);
+      opacity: 0; transform: translateX(-4px);
+      transition: opacity 0.2s, transform 0.2s;
     }
-    .expire-bar {
-      height: 100%; background: var(--amber-lo);
-      transition: width 1s linear;
-    }
+    .card:hover .card-open { opacity: 1; transform: none; }
 
-    /* ── Empty state ─────────────────────────────────────────── */
+    /* expire bar */
+    .expire-bar-wrap { height: 2px; background: var(--bg3); margin-top: 0.75rem; overflow: hidden; }
+    .expire-bar { height: 100%; background: var(--amber-lo); transition: width 1s linear; }
+
+    /* ── Empty state ──────────────────────────────────────────── */
     .empty {
       grid-column: 1 / -1; background: var(--bg);
       padding: 4rem 2rem; text-align: center;
     }
-    .empty-title {
-      font-size: 0.8rem; letter-spacing: 0.25em; color: var(--text-lo);
-      margin-bottom: 1rem;
-    }
-    .empty-hint {
-      font-size: 0.65rem; color: var(--text-dim); line-height: 2;
-    }
-    .empty-hint code {
-      color: var(--amber-lo); background: var(--bg2);
-      padding: 0.1rem 0.4rem;
-    }
-
-    /* ── Register Panel ──────────────────────────────────────── */
-    .panel {
-      margin-top: 2.5rem;
-      border: 1px solid var(--border);
-    }
-    .panel-hdr {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 0.7rem 1.5rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--bg2);
-      font-size: 0.6rem; letter-spacing: 0.3em; color: var(--text-lo);
-    }
-    .panel-body {
-      padding: 1.4rem 1.5rem;
-      display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem;
-      background: var(--bg2);
-    }
-
-    .field { display: flex; flex-direction: column; gap: 0.35rem; }
-    .field.full { grid-column: 1 / -1; }
-
-    label { font-size: 0.58rem; letter-spacing: 0.2em; color: var(--text-lo); }
-
-    input, textarea {
-      background: var(--bg); border: 1px solid var(--border);
-      color: var(--text); font-family: var(--mono); font-size: 0.78rem;
-      padding: 0.55rem 0.75rem; outline: none;
-      transition: border-color 0.15s, box-shadow 0.15s;
-    }
-    input:focus, textarea:focus {
-      border-color: var(--amber-lo);
-      box-shadow: 0 0 0 1px var(--amber-dim);
-    }
-    textarea { resize: vertical; min-height: 56px; }
-
-    .btn-row { grid-column: 1 / -1; display: flex; gap: 0.75rem; align-items: center; }
-
-    button {
-      font-family: var(--mono); font-size: 0.72rem; font-weight: 600;
-      letter-spacing: 0.12em; padding: 0.6rem 1.4rem;
-      cursor: pointer; border: none; transition: all 0.15s;
-    }
-    .btn-primary {
-      background: var(--amber); color: var(--bg);
-    }
-    .btn-primary:hover {
-      background: #f0b030;
-      box-shadow: 0 0 20px rgba(232,160,32,0.35);
-    }
-    .btn-ghost {
-      background: transparent; color: var(--text-lo);
-      border: 1px solid var(--border);
-    }
-    .btn-ghost:hover { color: var(--text); border-color: var(--text-lo); }
-
-    #reg-feedback { font-size: 0.65rem; color: var(--green); }
-
-    /* ── Toast ───────────────────────────────────────────────── */
-    #toast {
-      position: fixed; bottom: 2rem; right: 2.5rem; z-index: 10000;
-      padding: 0.7rem 1.4rem;
-      background: var(--bg3); border: 1px solid var(--green-lo);
-      color: var(--green); font-size: 0.72rem; letter-spacing: 0.08em;
-      transform: translateY(3rem); opacity: 0;
-      transition: transform 0.3s cubic-bezier(0.22,1,0.36,1), opacity 0.3s;
-    }
-    #toast.err { border-color: var(--red); color: var(--red); }
-    #toast.show { transform: translateY(0); opacity: 1; }
-
-    /* ── API docs snippet ────────────────────────────────────── */
-    .api-grid {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
-      border: 1px solid var(--border); background: var(--border);
-      margin-top: 1.5rem;
-    }
-    .api-row {
-      background: var(--bg2); padding: 0.75rem 1.2rem;
-      display: flex; align-items: baseline; gap: 1rem; font-size: 0.72rem;
-    }
-    .method { font-weight: 700; min-width: 3.5rem; }
-    .method.get { color: var(--green); }
-    .method.post { color: var(--amber); }
-    .method.del { color: var(--red); }
-    .path { color: var(--text); opacity: 0.8; }
-    .ep-desc { color: var(--text-lo); font-size: 0.62rem; margin-left: auto; }
+    .empty-title { font-size: 0.8rem; letter-spacing: 0.25em; color: var(--text-lo); margin-bottom: 1rem; }
+    .empty-hint { font-size: 0.65rem; color: var(--text-dim); line-height: 2.2; }
+    .empty-hint code { color: var(--amber-lo); background: var(--bg2); padding: 0.1rem 0.4rem; }
 
     /* entry animation */
     .card { animation: fadeIn 0.3s ease both; }
@@ -593,60 +587,10 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
 <div class="main">
   <div class="section-label">REGISTERED SERVICES</div>
   <div class="grid" id="grid"></div>
-
-  <!-- Manual registration form -->
-  <div class="panel">
-    <div class="panel-hdr">
-      <span>MANUAL REGISTRATION</span>
-      <span id="reg-feedback"></span>
-    </div>
-    <div class="panel-body">
-      <div class="field">
-        <label>Service Name *</label>
-        <input id="r-name" type="text" placeholder="my-api" autocomplete="off">
-      </div>
-      <div class="field">
-        <label>URL *</label>
-        <input id="r-url" type="text" placeholder="http://localhost:8080" autocomplete="off">
-      </div>
-      <div class="field full">
-        <label>Description</label>
-        <textarea id="r-desc" placeholder="What does this service do?"></textarea>
-      </div>
-      <div class="field">
-        <label>Tags (comma-separated)</label>
-        <input id="r-tags" type="text" placeholder="api, ml, inference">
-      </div>
-      <div class="field">
-        <label>TTL in seconds (blank = permanent)</label>
-        <input id="r-ttl" type="number" placeholder="300">
-      </div>
-      <div class="btn-row">
-        <button class="btn-primary" onclick="registerService()">▶ REGISTER</button>
-        <button class="btn-ghost" onclick="clearForm()">CLEAR</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- API Reference -->
-  <div style="margin-top:2.5rem">
-    <div class="section-label">API ENDPOINTS</div>
-    <div class="api-grid">
-      <div class="api-row"><span class="method get">GET</span>   <span class="path">/api/services</span>       <span class="ep-desc">list all services</span></div>
-      <div class="api-row"><span class="method post">POST</span> <span class="path">/api/register</span>       <span class="ep-desc">register a service</span></div>
-      <div class="api-row"><span class="method del">DEL</span>   <span class="path">/api/register/{name}</span> <span class="ep-desc">deregister by name</span></div>
-      <div class="api-row"><span class="method get">GET</span>   <span class="path">/</span>                    <span class="ep-desc">this portal</span></div>
-    </div>
-  </div>
 </div>
-
-<div id="toast"></div>
 
 <script>
   const REFRESH_MS = 3000;
-  let _services = [];
-
-  // ── Utilities ────────────────────────────────────────────────────────────
 
   function esc(s) {
     return String(s)
@@ -670,8 +614,6 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
     return Math.max(0, Math.min(100, (left / total) * 100));
   }
 
-  // ── Render ───────────────────────────────────────────────────────────────
-
   function renderGrid(data) {
     const grid = document.getElementById('grid');
     document.getElementById('svc-count').textContent = data.length;
@@ -690,85 +632,39 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     grid.innerHTML = data.map((s, i) => {
+      const proxyPath = `/proxy/${encodeURIComponent(s.name)}/`;
       const pct = ttlPct(s);
       const expireBar = pct !== null
         ? `<div class="expire-bar-wrap"><div class="expire-bar" style="width:${pct}%"></div></div>`
         : '';
       const tags = (s.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('');
       return `
-        <div class="card" style="animation-delay:${i * 40}ms"
-             onclick="window.open('${esc(s.url)}','_blank')">
+        <a class="card" href="${proxyPath}" target="_blank" style="animation-delay:${i * 40}ms">
           <div class="card-accent"></div>
+          <div class="card-open">↗</div>
           <div class="card-status"><span class="card-status-dot"></span>ONLINE</div>
           <div class="card-name">${esc(s.name)}</div>
-          <a class="card-url" href="${esc(s.url)}" target="_blank"
-             onclick="event.stopPropagation()">${esc(s.url)}</a>
+          <div class="card-proxy">
+            <span class="card-proxy-arrow">→</span>
+            <span>${esc(proxyPath)}</span>
+          </div>
           ${s.description ? `<div class="card-desc">${esc(s.description)}</div>` : ''}
           <div class="card-footer">
             <div class="tags">${tags}</div>
             <span class="card-time">${timeAgo(s.registered_at)}</span>
           </div>
           ${expireBar}
-        </div>`;
+        </a>`;
     }).join('');
   }
-
-  // ── Fetch ────────────────────────────────────────────────────────────────
 
   async function fetchServices() {
     try {
       const r = await fetch('/api/services');
       if (!r.ok) return;
-      _services = await r.json();
-      renderGrid(_services);
+      renderGrid(await r.json());
     } catch (_) {}
   }
-
-  // ── Register ─────────────────────────────────────────────────────────────
-
-  async function registerService() {
-    const name = document.getElementById('r-name').value.trim();
-    const url  = document.getElementById('r-url').value.trim();
-    const desc = document.getElementById('r-desc').value.trim();
-    const tags = document.getElementById('r-tags').value
-                   .split(',').map(t => t.trim()).filter(Boolean);
-    const ttlRaw = document.getElementById('r-ttl').value.trim();
-    const ttl  = ttlRaw ? parseInt(ttlRaw, 10) : null;
-
-    if (!name || !url) { showToast('Name and URL are required', true); return; }
-
-    try {
-      const r = await fetch('/api/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, url, description: desc, tags, ttl }),
-      });
-      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-      showToast(`✓  ${name}  registered`);
-      clearForm();
-      fetchServices();
-    } catch (e) { showToast(e.message, true); }
-  }
-
-  function clearForm() {
-    ['r-name','r-url','r-desc','r-tags','r-ttl'].forEach(id => {
-      document.getElementById(id).value = '';
-    });
-    document.getElementById('reg-feedback').textContent = '';
-  }
-
-  // ── Toast ────────────────────────────────────────────────────────────────
-
-  let _toastTimer;
-  function showToast(msg, err = false) {
-    const el = document.getElementById('toast');
-    el.textContent = msg;
-    el.className = err ? 'err show' : 'show';
-    clearTimeout(_toastTimer);
-    _toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
-  }
-
-  // ── Boot ─────────────────────────────────────────────────────────────────
 
   fetchServices();
   setInterval(fetchServices, REFRESH_MS);
