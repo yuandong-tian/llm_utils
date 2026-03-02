@@ -102,24 +102,29 @@ class GeminiAPI:
     """API wrapper for Google Gemini models.
 
     Supports key rotation across multiple API keys (GEMINI_API_KEY, GEMINI_API_KEY2, GEMINI_API_KEY3)
-    to distribute load and avoid rate limits.
+    to distribute load and avoid rate limits. A client is created for every
+    available key at init time; each generate() call randomly picks one,
+    spreading the daily quota across all keys.
     """
 
     def __init__(self, model_name: str = "gemini-2.5-flash", use_key_rotation: bool = True):
-        ENV_KEYS = ['GEMINI_API_KEY', 'GEMINI_API_KEY2', 'GEMINI_API_KEY3']
-        # Randomly pick one of the API keys
-        if use_key_rotation:
-            env_key = random.choice(ENV_KEYS)
-        else:
-            env_key = 'GEMINI_API_KEY'
-        api_key = get_env_var(env_key)
-        if not api_key:
-            raise RuntimeError(f"Missing {env_key} for Gemini API.")
-        self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
+        ENV_KEYS = ['GEMINI_API_KEY', 'GEMINI_API_KEY2', 'GEMINI_API_KEY3']
+        if use_key_rotation:
+            self._clients = [
+                genai.Client(api_key=get_env_var(k))
+                for k in ENV_KEYS
+                if get_env_var(k)
+            ]
+        else:
+            api_key = get_env_var('GEMINI_API_KEY')
+            self._clients = [genai.Client(api_key=api_key)] if api_key else []
+        if not self._clients:
+            raise RuntimeError("No Gemini API key found (GEMINI_API_KEY / _KEY2 / _KEY3).")
 
     def generate(self, prompt: str) -> str:
-        result = self.client.models.generate_content(
+        client = random.choice(self._clients)
+        result = client.models.generate_content(
             model=self.model_name,
             contents=prompt,
         )
@@ -429,6 +434,8 @@ class LLMCaller:
             "gemini-2.5-flash-preview-05-20" : lambda: GeminiAPI("gemini-2.5-flash-preview-05-20"),
             "gemini-2.5-pro-preview-05-06" : lambda: GeminiAPI("gemini-2.5-pro-preview-05-06"),
             "gemini-2.5-flash" : lambda: GeminiAPI("gemini-2.5-flash"),
+            "gemini-3-flash-preview" : lambda: GeminiAPI("gemini-3-flash-preview"),
+            "gemini-2.5-flash-lite"  : lambda: GeminiAPI("gemini-2.5-flash-lite"),
             "gpt-5.1" : lambda: OpenAIAPI("gpt-5.1"),
             "gpt-5-mini" : lambda: OpenAIAPI("gpt-5-mini"),
             "gpt-5-nano" : lambda: OpenAIAPI("gpt-5-nano"),
